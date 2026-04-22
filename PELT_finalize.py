@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 import PELT
+import PELT_geometry_features as pgf
 import incorporate_multichannel_segments as ims
 from open_SWOT_files import open_SWOT_files
 
@@ -24,6 +25,90 @@ DEFAULT_SWOT_NODE_DIR = "/Volumes/PhD/SWOT/RiverSP_D_parq/node/"
 DEFAULT_SWOT_REGION = "SA"
 WINDOW_VERSION_TO_KEY = {"raw": 0, "w2": 2, "w3": 3, "w4": 4, "w5": 5}
 WINDOW_VERSION_TO_N_WINDOWS = {"raw": 1, "w2": 2, "w3": 3, "w4": 4, "w5": 5}
+
+
+def _feature_cols_need_geometry(pelt_feature_cols):
+    return bool(set(PELT.normalize_feature_cols(pelt_feature_cols)) & {"sinu", "curv_int"})
+
+
+def _lookup_centerline(centerlines, mip, centerline_id_col="main_path_id", centerline_geometry_col="line"):
+    if centerlines is None:
+        return None
+    if isinstance(centerlines, dict):
+        if mip not in centerlines:
+            raise KeyError(f"Missing centerline for main path id {mip}.")
+        return centerlines[mip]
+
+    if centerline_id_col not in centerlines.columns:
+        raise ValueError(f"centerlines is missing id column '{centerline_id_col}'.")
+    if centerline_geometry_col not in centerlines.columns:
+        raise ValueError(f"centerlines is missing geometry column '{centerline_geometry_col}'.")
+
+    matches = centerlines.loc[centerlines[centerline_id_col] == mip]
+    if matches.empty:
+        raise KeyError(f"Missing centerline for {centerline_id_col}={mip}.")
+    if len(matches) > 1:
+        raise ValueError(f"Expected one centerline for {centerline_id_col}={mip}; found {len(matches)}.")
+    return matches.iloc[0][centerline_geometry_col]
+
+
+def _prepare_centerline_for_features(
+    centerlines,
+    mip,
+    nodes_df,
+    pelt_feature_cols,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    check_orientation=True,
+):
+    if not _feature_cols_need_geometry(pelt_feature_cols):
+        return None, {}
+    centerline = _lookup_centerline(
+        centerlines,
+        mip,
+        centerline_id_col=centerline_id_col,
+        centerline_geometry_col=centerline_geometry_col,
+    )
+    if centerline is None:
+        raise ValueError(
+            "Geometry feature columns were requested, but no centerlines lookup was provided."
+        )
+
+    geometry_summary = pgf.summarize_centerline_geometries(
+        {mip: centerline},
+        id_col=centerline_id_col,
+        assert_all_linestring=True,
+    )
+    qa = {
+        "centerline_id": mip,
+        "centerline_geometry_type": str(geometry_summary["geometry_type"].iloc[0]),
+        "centerline_length_m": float(geometry_summary["length_m"].iloc[0]),
+        "centerline_is_multilinestring": bool(geometry_summary["is_multilinestring"].iloc[0]),
+    }
+
+    if check_orientation:
+        centerline, orientation_qa = pgf.orient_centerline_to_node_dist(
+            centerline,
+            nodes_df,
+            dist_col="dist_m",
+            node_geometry_col=node_geometry_col,
+            reverse_if_needed=True,
+        )
+        qa.update(orientation_qa)
+
+    return centerline, qa
+
+
+def _attach_geometry_qa(result, centerline_qa):
+    if centerline_qa:
+        result["geometry_qa"] = centerline_qa
+    if result.get("geometry_features_by_window") is not None:
+        result["geometry_feature_nan_rates"] = pgf.summarize_geometry_feature_nan_rates(
+            result["features_by_window"],
+            feature_cols=("sinu", "curv_int"),
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -397,6 +482,12 @@ def _run_base_reach_pipeline(
     pelt_feature_cols=("width_s", "nch_s"),
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
+    centerlines=None,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    geometry_feature_cfg=None,
+    check_centerline_orientation=True,
     print_timings=False,
 ):
     window_runs = _build_window_runs()
@@ -411,8 +502,18 @@ def _run_base_reach_pipeline(
         swot_node_dir=swot_node_dir,
         swot_region=swot_region,
     )
+    centerline, centerline_qa = _prepare_centerline_for_features(
+        centerlines=centerlines,
+        mip=mip,
+        nodes_df=reach_nodes_df,
+        pelt_feature_cols=pelt_feature_cols,
+        centerline_id_col=centerline_id_col,
+        centerline_geometry_col=centerline_geometry_col,
+        node_geometry_col=node_geometry_col,
+        check_orientation=check_centerline_orientation,
+    )
 
-    return PELT.run_full_pipeline(
+    result = PELT.run_full_pipeline(
         nodes_df=reach_nodes_df,
         feat_cfg=PELT.FeatureConfig(
             dist_col="dist_m",
@@ -438,7 +539,10 @@ def _run_base_reach_pipeline(
             break_selection_grid=PELT.BreakSelectionGridConfig(enabled=False),
             print_timings=print_timings,
         ),
+        centerline=centerline,
+        geometry_feature_cfg=geometry_feature_cfg,
     )
+    return _attach_geometry_qa(result, centerline_qa)
 
 
 def _finalize_base_result(
@@ -495,6 +599,12 @@ def build_base_results_batch(
     pelt_feature_cols=("width_s", "nch_s"),
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
+    centerlines=None,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    geometry_feature_cfg=None,
+    check_centerline_orientation=True,
     show_progress=False,
     print_timings=False,
 ):
@@ -523,6 +633,12 @@ def build_base_results_batch(
             pelt_feature_cols=pelt_feature_cols,
             swot_node_dir=swot_node_dir,
             swot_region=swot_region,
+            centerlines=centerlines,
+            centerline_id_col=centerline_id_col,
+            centerline_geometry_col=centerline_geometry_col,
+            node_geometry_col=node_geometry_col,
+            geometry_feature_cfg=geometry_feature_cfg,
+            check_centerline_orientation=check_centerline_orientation,
             print_timings=print_timings,
         )
 
@@ -546,6 +662,12 @@ def run_final_reach_pipeline(
     consensus_cfg: PELT.ConsensusConfig = PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG,
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
+    centerlines=None,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    geometry_feature_cfg=None,
+    check_centerline_orientation=True,
     make_plot=False,
     save_exports=False,
     outdir=DEFAULT_OUTDIR,
@@ -560,6 +682,12 @@ def run_final_reach_pipeline(
         pelt_feature_cols=pelt_feature_cols,
         swot_node_dir=swot_node_dir,
         swot_region=swot_region,
+        centerlines=centerlines,
+        centerline_id_col=centerline_id_col,
+        centerline_geometry_col=centerline_geometry_col,
+        node_geometry_col=node_geometry_col,
+        geometry_feature_cfg=geometry_feature_cfg,
+        check_centerline_orientation=check_centerline_orientation,
         print_timings=print_timings,
     )
 
@@ -591,6 +719,12 @@ def run_final_batch(
     consensus_cfg: PELT.ConsensusConfig = PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG,
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
+    centerlines=None,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    geometry_feature_cfg=None,
+    check_centerline_orientation=True,
     make_plots=False,
     save_exports=True,
     show_progress=False,
@@ -616,6 +750,8 @@ def run_final_batch(
     settings_tables = []
     consensus_tables = []
     run_summary_tables = []
+    geometry_qa_rows = []
+    geometry_nan_tables = []
 
     if base_results_dict is None:
         base_run_outputs = build_base_results_batch(
@@ -627,6 +763,12 @@ def run_final_batch(
             pelt_feature_cols=pelt_feature_cols,
             swot_node_dir=swot_node_dir,
             swot_region=swot_region,
+            centerlines=centerlines,
+            centerline_id_col=centerline_id_col,
+            centerline_geometry_col=centerline_geometry_col,
+            node_geometry_col=node_geometry_col,
+            geometry_feature_cfg=geometry_feature_cfg,
+            check_centerline_orientation=check_centerline_orientation,
             show_progress=show_progress,
             print_timings=print_timings,
         )
@@ -660,6 +802,13 @@ def run_final_batch(
         )
 
         results_dict[run_key] = result
+        if result.get("geometry_qa"):
+            geometry_qa_rows.append({"run_key": run_key, **dict(result["geometry_qa"])})
+        nan_rates = result.get("geometry_feature_nan_rates")
+        if nan_rates is not None and not nan_rates.empty:
+            tmp = nan_rates.copy()
+            tmp["run_key"] = run_key
+            geometry_nan_tables.append(tmp)
 
         settings_df, consensus_df, run_summary_df = PELT.extract_pelt_grid_analysis_tables(
             result,
@@ -679,12 +828,25 @@ def run_final_batch(
     grid_settings_master_df = pd.concat(settings_tables, ignore_index=True)
     grid_consensus_master_df = pd.concat(consensus_tables, ignore_index=True)
     grid_run_summary_master_df = pd.concat(run_summary_tables, ignore_index=True)
+    geometry_qa_master_df = pd.DataFrame(geometry_qa_rows)
+    geometry_feature_nan_rates_master_df = (
+        pd.concat(geometry_nan_tables, ignore_index=True)
+        if geometry_nan_tables
+        else pd.DataFrame()
+    )
 
     results_pickle_path = None
     if save_exports:
         grid_settings_master_df.to_csv(outdir / "PELT_final_settings_master.csv", index=False)
         grid_consensus_master_df.to_csv(outdir / "PELT_final_consensus_master.csv", index=False)
         grid_run_summary_master_df.to_csv(outdir / "PELT_final_run_summary_master.csv", index=False)
+        if not geometry_qa_master_df.empty:
+            geometry_qa_master_df.to_csv(outdir / "PELT_final_geometry_qa_master.csv", index=False)
+        if not geometry_feature_nan_rates_master_df.empty:
+            geometry_feature_nan_rates_master_df.to_csv(
+                outdir / "PELT_final_geometry_feature_nan_rates_master.csv",
+                index=False,
+            )
 
         results_pickle_path = outdir / DEFAULT_RESULTS_PICKLE
         with open(results_pickle_path, "wb") as f:
@@ -695,6 +857,8 @@ def run_final_batch(
         "grid_settings_master_df": grid_settings_master_df,
         "grid_consensus_master_df": grid_consensus_master_df,
         "grid_run_summary_master_df": grid_run_summary_master_df,
+        "geometry_qa_master_df": geometry_qa_master_df,
+        "geometry_feature_nan_rates_master_df": geometry_feature_nan_rates_master_df,
         "results_pickle_path": results_pickle_path,
         "window_version": window_version,
         "selector_settings": [s.__dict__ for s in selector_settings],
@@ -702,6 +866,7 @@ def run_final_batch(
         "stable_support_frac_min": stable_support_frac_min,
         "consensus_method": str(consensus_cfg.method),
         "merge_threshold_m": float(consensus_cfg.merge_threshold_m),
+        "pelt_feature_cols": tuple(pelt_feature_cols),
     }
 
 
@@ -827,6 +992,12 @@ def run_final_support_sweep(
     consensus_cfg: PELT.ConsensusConfig = PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG,
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
+    centerlines=None,
+    centerline_id_col="main_path_id",
+    centerline_geometry_col="line",
+    node_geometry_col="geometry",
+    geometry_feature_cfg=None,
+    check_centerline_orientation=True,
     make_plots=False,
     save_exports=True,
     show_progress=False,
@@ -850,6 +1021,12 @@ def run_final_support_sweep(
         pelt_feature_cols=pelt_feature_cols,
         swot_node_dir=swot_node_dir,
         swot_region=swot_region,
+        centerlines=centerlines,
+        centerline_id_col=centerline_id_col,
+        centerline_geometry_col=centerline_geometry_col,
+        node_geometry_col=node_geometry_col,
+        geometry_feature_cfg=geometry_feature_cfg,
+        check_centerline_orientation=check_centerline_orientation,
         show_progress=show_progress,
         print_timings=print_timings,
     )
@@ -883,6 +1060,12 @@ def run_final_support_sweep(
             consensus_cfg=consensus_cfg,
             swot_node_dir=swot_node_dir,
             swot_region=swot_region,
+            centerlines=centerlines,
+            centerline_id_col=centerline_id_col,
+            centerline_geometry_col=centerline_geometry_col,
+            node_geometry_col=node_geometry_col,
+            geometry_feature_cfg=geometry_feature_cfg,
+            check_centerline_orientation=check_centerline_orientation,
             make_plots=make_plots,
             save_exports=save_exports,
             show_progress=False,

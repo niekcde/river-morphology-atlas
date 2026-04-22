@@ -7,9 +7,11 @@ import numpy as np
 import pandas as pd
 
 try:
-    from shapely.geometry import LineString
+    from shapely.geometry import LineString, MultiLineString, Point
 except Exception:  # pragma: no cover - import-time guard for environments without shapely
     LineString = None
+    MultiLineString = None
+    Point = None
 
 try:
     from scipy.ndimage import gaussian_filter1d
@@ -57,6 +59,163 @@ def _as_linestring(centerline):
     if centerline.is_empty or float(centerline.length) <= 0:
         raise ValueError("centerline must be a non-empty LineString with positive length.")
     return centerline
+
+
+def reverse_linestring(centerline):
+    ls = _as_linestring(centerline)
+    return LineString(list(ls.coords)[::-1])
+
+
+def summarize_centerline_geometries(
+    centerlines,
+    id_col: str = "main_path_id",
+    geometry_col: str = "line",
+    assert_all_linestring: bool = False,
+) -> pd.DataFrame:
+    """
+    Summarize centerline geometry types and optionally fail on non-LineStrings.
+    """
+    rows = []
+    if isinstance(centerlines, dict):
+        iterator = centerlines.items()
+    else:
+        if id_col not in centerlines.columns:
+            raise ValueError(f"centerlines is missing id column '{id_col}'.")
+        if geometry_col not in centerlines.columns:
+            raise ValueError(f"centerlines is missing geometry column '{geometry_col}'.")
+        iterator = (
+            (row[id_col], row[geometry_col])
+            for _, row in centerlines.iterrows()
+        )
+
+    for key, geom in iterator:
+        geom_type = None if geom is None else getattr(geom, "geom_type", type(geom).__name__)
+        rows.append(
+            {
+                id_col: key,
+                "geometry_type": geom_type,
+                "is_linestring": bool(LineString is not None and isinstance(geom, LineString)),
+                "is_multilinestring": bool(MultiLineString is not None and isinstance(geom, MultiLineString)),
+                "is_empty": bool(geom is None or getattr(geom, "is_empty", False)),
+                "length_m": float(getattr(geom, "length", np.nan)) if geom is not None else np.nan,
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+    if assert_all_linestring and not summary.empty:
+        bad = summary[~summary["is_linestring"] | summary["is_empty"]].copy()
+        if not bad.empty:
+            sample = bad[id_col].head(10).tolist()
+            raise ValueError(
+                f"Expected all centerlines to be non-empty LineStrings; "
+                f"found {len(bad)} invalid geometries. Sample {id_col}: {sample}"
+            )
+    return summary
+
+
+def _node_point_from_row(row, geometry_col: str = "geometry"):
+    if Point is None:
+        raise ImportError("shapely is required for geometry QA.")
+    if geometry_col in row.index:
+        geom = row[geometry_col]
+        if geom is not None and not getattr(geom, "is_empty", True) and hasattr(geom, "x") and hasattr(geom, "y"):
+            return geom
+    if {"x", "y"}.issubset(row.index):
+        x = row["x"]
+        y = row["y"]
+        if np.isfinite(x) and np.isfinite(y):
+            return Point(float(x), float(y))
+    return None
+
+
+def orient_centerline_to_node_dist(
+    centerline,
+    nodes_df: pd.DataFrame,
+    dist_col: str = "dist_m",
+    node_geometry_col: str = "geometry",
+    reverse_if_needed: bool = True,
+    tolerance_m: float = 1e-6,
+):
+    """
+    Orient a LineString so distance 0 is nearest the lowest node distance.
+
+    Returns:
+      oriented_centerline, qa_dict
+    """
+    ls = _as_linestring(centerline)
+    if dist_col not in nodes_df.columns:
+        raise ValueError(f"nodes_df is missing distance column '{dist_col}'.")
+
+    nodes = nodes_df.sort_values(dist_col).reset_index(drop=True)
+    qa = {
+        "orientation_checked": False,
+        "orientation_status": "not_checked",
+        "reversed": False,
+        "forward_endpoint_error_m": np.nan,
+        "reversed_endpoint_error_m": np.nan,
+        "orientation_margin_m": np.nan,
+        "first_node_dist_m": float(nodes[dist_col].iloc[0]) if len(nodes) else np.nan,
+        "last_node_dist_m": float(nodes[dist_col].iloc[-1]) if len(nodes) else np.nan,
+    }
+
+    if nodes.empty:
+        qa["orientation_status"] = "no_nodes"
+        return ls, qa
+
+    first_node = _node_point_from_row(nodes.iloc[0], geometry_col=node_geometry_col)
+    last_node = _node_point_from_row(nodes.iloc[-1], geometry_col=node_geometry_col)
+    if first_node is None or last_node is None:
+        qa["orientation_status"] = "missing_node_geometry"
+        return ls, qa
+
+    line_start = Point(ls.coords[0])
+    line_end = Point(ls.coords[-1])
+    forward_error = float(line_start.distance(first_node) + line_end.distance(last_node))
+    reversed_error = float(line_start.distance(last_node) + line_end.distance(first_node))
+    margin = forward_error - reversed_error
+
+    qa.update(
+        {
+            "orientation_checked": True,
+            "forward_endpoint_error_m": forward_error,
+            "reversed_endpoint_error_m": reversed_error,
+            "orientation_margin_m": float(margin),
+        }
+    )
+
+    if reversed_error + float(tolerance_m) < forward_error:
+        qa["orientation_status"] = "reversed_to_match_node_dist"
+        qa["reversed"] = bool(reverse_if_needed)
+        return (reverse_linestring(ls) if reverse_if_needed else ls), qa
+
+    if abs(margin) <= float(tolerance_m):
+        qa["orientation_status"] = "ambiguous"
+    else:
+        qa["orientation_status"] = "matches_node_dist"
+    return ls, qa
+
+
+def summarize_geometry_feature_nan_rates(
+    features_by_window: Dict[str, pd.DataFrame],
+    feature_cols: Sequence[str] = ("sinu", "curv_int"),
+) -> pd.DataFrame:
+    rows = []
+    for window_label, fdf in features_by_window.items():
+        for col in feature_cols:
+            if col not in fdf.columns:
+                continue
+            values = fdf[col].to_numpy(dtype=float)
+            rows.append(
+                {
+                    "window_label": window_label,
+                    "feature": col,
+                    "n": int(len(values)),
+                    "n_finite": int(np.isfinite(values).sum()),
+                    "n_missing": int((~np.isfinite(values)).sum()),
+                    "missing_frac": float(np.mean(~np.isfinite(values))) if len(values) else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _fill_nearest(values: np.ndarray) -> np.ndarray:

@@ -72,6 +72,57 @@ def report_feature_health(df: pd.DataFrame, label: str, cols: Sequence[str]) -> 
         # )
 
 
+def _has_external_window_feature(
+    external_by_window: Optional[Dict[str, pd.DataFrame]],
+    feature_col: str,
+) -> bool:
+    if external_by_window is None:
+        return False
+    return any(feature_col in fdf.columns for fdf in external_by_window.values())
+
+
+def _aligned_external_window_feature(
+    external_df: pd.DataFrame,
+    dist: np.ndarray,
+    dist_col: str,
+    feature_col: str,
+    window_label_used: str,
+) -> np.ndarray:
+    require_cols(external_df, [dist_col, feature_col])
+    ext = ensure_sorted_by_dist(external_df[[dist_col, feature_col]].copy(), dist_col)
+    ext_dist = ext[dist_col].to_numpy(dtype=float)
+    ext_values = ext[feature_col].to_numpy(dtype=float)
+
+    if len(ext_dist) == len(dist) and np.allclose(ext_dist, dist, rtol=0.0, atol=1e-6):
+        return ext_values
+
+    merged = pd.DataFrame({dist_col: dist}).merge(ext, on=dist_col, how="left")
+    out = merged[feature_col].to_numpy(dtype=float)
+    missing = ~np.isfinite(out)
+    if not np.any(missing):
+        return out
+
+    finite = np.isfinite(ext_dist) & np.isfinite(ext_values)
+    if int(np.sum(finite)) >= 2:
+        interp = np.interp(
+            dist,
+            ext_dist[finite],
+            ext_values[finite],
+            left=np.nan,
+            right=np.nan,
+        )
+        out[missing] = interp[missing]
+    elif int(np.sum(finite)) == 1:
+        out[missing] = float(ext_values[finite][0])
+
+    if np.all(~np.isfinite(out)):
+        raise ValueError(
+            f"{window_label_used}: external geometry feature '{feature_col}' "
+            "could not be aligned to node distances."
+        )
+    return out
+
+
 def rolling_sinuosity_from_xy_nodes(
     x: np.ndarray,
     y: np.ndarray,
@@ -838,6 +889,7 @@ def build_multiscale_features(
     cfg: FeatureConfig = FeatureConfig(),
     min_pts_in_window: int = 5,
     feature_cols_to_compute: Optional[Sequence[str]] = None,
+    geometry_features_by_window: Optional[Dict[str, pd.DataFrame]] = None,
     report_health: bool = True,
 ) -> Dict[str, pd.DataFrame]:
     """
@@ -849,6 +901,11 @@ def build_multiscale_features(
     """
     selected = normalize_feature_cols(feature_cols_to_compute or FEATURE_COLS_ALL)
     require_cols(nodes_df, [cfg.dist_col])
+    external_geometry_cols = {
+        c
+        for c in ("sinu", "curv_int")
+        if _has_external_window_feature(geometry_features_by_window, c)
+    }
 
     if "slope" in selected:
         require_cols(nodes_df, [cfg.wse_col])
@@ -856,12 +913,12 @@ def build_multiscale_features(
         require_cols(nodes_df, [cfg.width_col])
     if "nch_s" in selected:
         require_cols(nodes_df, [cfg.nch_col])
-    if "curv_int" in selected and cfg.curvature_col not in nodes_df.columns:
+    if "curv_int" in selected and "curv_int" not in external_geometry_cols and cfg.curvature_col not in nodes_df.columns:
         raise ValueError(
             f"Requested 'curv_int' but nodes_df is missing '{cfg.curvature_col}'. "
             "Provide curvature or a centerline / geom_df_10m upstream."
         )
-    if "sinu" in selected and not {"x", "y"}.issubset(nodes_df.columns):
+    if "sinu" in selected and "sinu" not in external_geometry_cols and not {"x", "y"}.issubset(nodes_df.columns):
         raise ValueError(
             "Requested 'sinu' but nodes_df is missing x/y columns. "
             "Provide node x/y directly or provide a centerline / geom_df_10m upstream."
@@ -874,7 +931,7 @@ def build_multiscale_features(
 
     wse = df[cfg.wse_col].to_numpy(dtype=float) if "slope" in selected else None
     curv = None
-    if "curv_int" in selected:
+    if "curv_int" in selected and "curv_int" not in external_geometry_cols:
         curv = df[cfg.curvature_col].to_numpy(dtype=float)
         if cfg.use_abs_curvature:
             curv = np.abs(curv)
@@ -894,16 +951,18 @@ def build_multiscale_features(
             )
         else:
             nch = nch_raw
-    x = df["x"].to_numpy(dtype=float) if "sinu" in selected else None
-    y = df["y"].to_numpy(dtype=float) if "sinu" in selected else None
+    x = df["x"].to_numpy(dtype=float) if "sinu" in selected and "sinu" not in external_geometry_cols else None
+    y = df["y"].to_numpy(dtype=float) if "sinu" in selected and "sinu" not in external_geometry_cols else None
 
     for Wm in windows_m:
         is_raw_window = float(Wm) <= 0.0
+        label = window_label(float(Wm))
         if is_raw_window:
             unsupported = [c for c in selected if c not in {"width_s", "nch_s"}]
             if unsupported:
                 raise ValueError(
                     "Raw window mode only supports width_s and nch_s. "
+                    "Geometry features require positive window sizes. "
                     f"Unsupported raw features requested: {unsupported}"
                 )
             window_pts = 1
@@ -911,8 +970,10 @@ def build_multiscale_features(
             window_pts = int(np.round(Wm / spacing))
             window_pts = max(window_pts, 3)
 
-        label = window_label(float(Wm))
         fdf = pd.DataFrame({cfg.dist_col: dist})
+        external_fdf = None
+        if geometry_features_by_window is not None:
+            external_fdf = geometry_features_by_window.get(label)
 
         if "slope" in selected:
             slope = rolling_linear_slope_missing_aware(
@@ -930,20 +991,38 @@ def build_multiscale_features(
             fdf["slope"] = slope
 
         if "curv_int" in selected:
-            fdf["curv_int"] = rolling_robust_summary(
-                curv,
-                window_pts=window_pts,
-                func=cfg.curvature_summary,
-                min_pts=min_pts_in_window,
-            )
+            if external_fdf is not None and "curv_int" in external_fdf.columns:
+                fdf["curv_int"] = _aligned_external_window_feature(
+                    external_fdf,
+                    dist,
+                    cfg.dist_col,
+                    "curv_int",
+                    label,
+                )
+            else:
+                fdf["curv_int"] = rolling_robust_summary(
+                    curv,
+                    window_pts=window_pts,
+                    func=cfg.curvature_summary,
+                    min_pts=min_pts_in_window,
+                )
 
         if "sinu" in selected:
-            fdf["sinu"] = rolling_sinuosity_from_xy_nodes(
-                x,
-                y,
-                window_pts=window_pts,
-                min_pts=min_pts_in_window,
-            )
+            if external_fdf is not None and "sinu" in external_fdf.columns:
+                fdf["sinu"] = _aligned_external_window_feature(
+                    external_fdf,
+                    dist,
+                    cfg.dist_col,
+                    "sinu",
+                    label,
+                )
+            else:
+                fdf["sinu"] = rolling_sinuosity_from_xy_nodes(
+                    x,
+                    y,
+                    window_pts=window_pts,
+                    min_pts=min_pts_in_window,
+                )
 
         if "width_s" in selected:
             if is_raw_window:
@@ -1873,6 +1952,7 @@ def run_full_pipeline(
         pipe_cfg: PipelineConfig = PipelineConfig(),
         centerline=None,
         geom_df_10m: Optional[pd.DataFrame] = None,
+        geometry_feature_cfg=None,
     ) -> Dict[str, object]:
     
     timings: Dict[str, float] = {}
@@ -1885,6 +1965,7 @@ def run_full_pipeline(
         else pelt_feature_cols
     )
     feature_cols_to_compute = tuple(unique_preserve_order(pelt_feature_cols + break_feature_cols))
+    geometry_feature_cols = tuple(c for c in feature_cols_to_compute if c in {"sinu", "curv_int"})
 
     t0 = perf_counter()
     effective_window_cfg = get_effective_window_selection_config(pipe_cfg)
@@ -1896,14 +1977,60 @@ def run_full_pipeline(
     timings["window_selection"] = perf_counter() - t0
 
     t0 = perf_counter()
-    prepared_nodes_df, geom_df_used = prepare_nodes_for_requested_features(
-        nodes_df=nodes_df,
-        requested_feature_cols=feature_cols_to_compute,
-        feat_cfg=feat_cfg,
-        centerline=centerline,
-        geom_df_10m=geom_df_10m,
-    )
+    feature_cols_for_node_prepare = tuple(
+        c for c in feature_cols_to_compute if c not in {"sinu", "curv_int"}
+    ) if geometry_feature_cols else feature_cols_to_compute
+    if feature_cols_for_node_prepare:
+        prepared_nodes_df, geom_df_used = prepare_nodes_for_requested_features(
+            nodes_df=nodes_df,
+            requested_feature_cols=feature_cols_for_node_prepare,
+            feat_cfg=feat_cfg,
+            centerline=centerline,
+            geom_df_10m=geom_df_10m,
+        )
+    else:
+        prepared_nodes_df = ensure_sorted_by_dist(nodes_df.copy(), feat_cfg.dist_col).reset_index(drop=True)
+        geom_df_used = geom_df_10m.copy() if geom_df_10m is not None else None
     timings["prepare_nodes"] = perf_counter() - t0
+
+    geometry_features_by_window = None
+    geometry_feature_diagnostics = {}
+    if geometry_feature_cols:
+        raw_windows = [float(w) for w in resolved_windows_m if float(w) <= 0.0]
+        if raw_windows:
+            raise ValueError(
+                "Requested geometry features with raw window selection. "
+                "Use positive PELT windows for 'sinu' and 'curv_int'."
+            )
+        if centerline is None:
+            raise ValueError(
+                "Requested geometry features require a concatenated LineString centerline. "
+                "The newer PELT_geometry_features definitions are used for 'sinu' and "
+                "'curv_int'; the older PELT.py geometry hooks are not used by run_full_pipeline."
+            )
+
+        t0 = perf_counter()
+        import PELT_geometry_features as pgf
+
+        geom_feat_cfg = geometry_feature_cfg
+        if geom_feat_cfg is None:
+            geom_feat_cfg = pgf.GeometryFeatureConfig(
+                dist_col=feat_cfg.dist_col,
+                width_col=feat_cfg.width_col,
+            )
+
+        geometry_features_by_window, geometry_feature_diagnostics = (
+            pgf.compute_geometry_features_for_windows(
+                centerline=centerline,
+                nodes_df=prepared_nodes_df,
+                windows_m=resolved_windows_m,
+                cfg=geom_feat_cfg,
+                return_diagnostics=True,
+            )
+        )
+        if geom_df_used is None:
+            geom_df_used = geometry_feature_diagnostics.get("geom_base")
+        timings["geometry_features"] = perf_counter() - t0
 
     t0 = perf_counter()
     features_by_window = build_multiscale_features(
@@ -1912,6 +2039,7 @@ def run_full_pipeline(
         cfg=feat_cfg,
         min_pts_in_window=pipe_cfg.min_pts_in_window,
         feature_cols_to_compute=feature_cols_to_compute,
+        geometry_features_by_window=geometry_features_by_window,
         report_health=pipe_cfg.report_feature_health,
     )
     timings["feature_building"] = perf_counter() - t0
@@ -2024,6 +2152,11 @@ def run_full_pipeline(
     return {
         "nodes_used": prepared_nodes_df,
         "geom_df_10m": geom_df_used,
+        "geometry_features_by_window": geometry_features_by_window,
+        "geometry_feature_diagnostics": geometry_feature_diagnostics,
+        "geometry_feature_source": (
+            "PELT_geometry_features" if geometry_feature_cols else None
+        ),
         "dist_col_used": feat_cfg.dist_col,
         "width_col_used": feat_cfg.width_col,
         "pelt_jump": pelt_cfg.jump,

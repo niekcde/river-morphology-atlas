@@ -12,6 +12,12 @@ This pipeline now uses one shared frozen breakpoint-consensus method from the st
   One-time calibration utilities for the consensus merge threshold from saved tuning outputs.
 - `PELT_finalize.py`
   Final reach segmentation using the tuned window family and retained selector settings.
+- `PELT_geometry_features.py`
+  Newer sinuosity/curvature feature definitions used when `sinu` or `curv_int` are selected.
+- `PELT_segmentation_runner.py`
+  Configured runner for the five standard segmentation setups, including two-stage runs.
+- `reach_concatenation.py`
+  Builds continuous main-path centerlines used by the geometry features.
 - `PELT_tuning_parallel_call.py`
   Example batch entry point for the broad tuning run.
 - `incorporate_multichannel_segments.py`
@@ -58,6 +64,7 @@ grid_outputs = pt.PELT_grid_search_parallel(
     PELT_penalties=(2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0),
     min_support_frac_runs_values=(0.05, 0.10, 0.15, 0.20, 0.25),
     stop_rel_improvement_values=(0.04, 0.045, 0.05, 0.06),
+    pelt_feature_cols=("width_s", "nch_s"),
     consensus_cfg=PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG,
     make_plots=False,
     print_timings=False,
@@ -66,6 +73,11 @@ grid_outputs = pt.PELT_grid_search_parallel(
     outdir="test_figures",
 )
 ```
+
+Use `pelt_feature_cols=("sinu", "curv_int")` or
+`("width_s", "nch_s", "sinu", "curv_int")` for geometry or mixed runs. Geometry
+feature runs require concatenated centerlines keyed by `main_path_id`, and should
+use positive window families only, for example `input_windows=[2, 3, 4, 5]`.
 
 Main outputs:
 
@@ -134,12 +146,18 @@ final_outputs = pf.run_final_batch(
     dfN=dfN,
     mips=mips,
     window_key=2,
+    pelt_feature_cols=("width_s", "nch_s"),
     selector_settings=pf.get_stage1_w2_selector_settings(),
     consensus_cfg=PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG,
     save_exports=True,
     outdir="test_figures_final",
 )
 ```
+
+For geometry-enabled finalization, pass `centerlines=<dataframe or dict>` where
+the dataframe has `main_path_id` and `line` columns. The finalizer asserts that
+centerlines are LineStrings, orients them to increasing node `dist_m`, and stores
+geometry feature missing-rate QA in each result.
 
 Main final outputs:
 
@@ -149,6 +167,36 @@ Main final outputs:
 - `grid_run_summary_master_df`
 - `stable_breaks_m` per reach
 - `stable_segments` per reach
+
+### 5. Five configured setups
+
+`PELT_segmentation_runner.py` defines the five standard setups:
+
+1. `01_width_channels`: `width_s + nch_s`
+2. `02_sinuosity_curvature`: `sinu + curv_int`
+3. `03_all_features`: `width_s + nch_s + sinu + curv_int`
+4. `04_width_channels_then_geometry`
+5. `05_geometry_then_width_channels`
+
+Example:
+
+```python
+import PELT_segmentation_runner as psr
+
+centerlines, centerline_qa = psr.build_centerlines_from_edges(dfG)
+
+outputs = psr.run_all_segmentation_setups(
+    df=dfG,
+    dfN=dfN,
+    mips=mips,
+    centerlines=centerlines,
+    outdir="PELT_outputs",
+    swot_node_dir=SWOT_NODE_DIR,
+    swot_region="SA",
+)
+```
+
+Each setup writes to a separate named output directory.
 
 ## What Produces the Final Segmentation
 

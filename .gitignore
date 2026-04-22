@@ -1,0 +1,46 @@
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter transient files
+.ipynb_checkpoints/
+
+# Local environments and editor metadata
+.venv/
+venv/
+env/
+.env
+.DS_Store
+
+# Generated PELT outputs
+test_figures*/
+PELT_outputs*/
+outputs/
+output/
+results/
+
+# Generated analysis artifacts
+*.pkl
+*.pickle
+*.parquet
+*.gpkg
+*.feather
+*.csv
+*.json
+
+# Local scratch/backups
+scratch/
+tmp/
+temp/
+backup*/
+backups/
+old/
+old_*/
+*_backup.*
+*.bak
