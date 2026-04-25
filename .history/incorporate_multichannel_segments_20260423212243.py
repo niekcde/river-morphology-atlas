@@ -737,7 +737,6 @@ def run_code(dfG, mpi, df_node):
     df_node = df_node[df_node['reach_id'].isin(D['reach_id'])]
 
     nchanNode = df_node.groupby('reach_id', as_index = False)['n_chan_mod'].mean()
-    
     nchanNode = nchanNode.rename(columns = {'n_chan_mod':'multi_n_chan'})
 
 

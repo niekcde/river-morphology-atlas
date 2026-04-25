@@ -25,10 +25,6 @@ def _feature_cols_need_geometry(pelt_feature_cols):
     return bool(set(PELT.normalize_feature_cols(pelt_feature_cols)) & {"sinu", "curv_int"})
 
 
-def _feature_cols_need_wse(pelt_feature_cols):
-    return "slope" in set(PELT.normalize_feature_cols(pelt_feature_cols))
-
-
 def _lookup_centerline(centerlines, mip, centerline_id_col="main_path_id", centerline_geometry_col="line"):
     if centerlines is None:
         return None
@@ -125,8 +121,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=2,
                 width_col="multi_width",
-                low_quantile=0.10,
-                high_quantile=0.90,
+                low_quantile=0.25,
+                high_quantile=0.75,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -141,8 +137,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=3,
                 width_col="multi_width",
-                low_quantile=0.10,
-                high_quantile=0.90,
+                low_quantile=0.25,
+                high_quantile=0.75,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -157,8 +153,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=4,
                 width_col="multi_width",
-                low_quantile=0.10,
-                high_quantile=0.90,
+                low_quantile=0.25,
+                high_quantile=0.75,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -173,8 +169,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=5,
                 width_col="multi_width",
-                low_quantile=0.10,
-                high_quantile=0.90,
+                low_quantile=0.25,
+                high_quantile=0.75,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -199,81 +195,23 @@ def _prepare_reach_nodes(
     df,
     dfN,
     mip,
-    pelt_feature_cols=("width_s", "nch_s"),
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
 ):
     D, DN = ims.run_code(df, mip, dfN)
 
-    dist_out_col = "hydro_dist_out" if "hydro_dist_out" in DN.columns else "dist_out"
-    node_length_col = "node_length" if "node_length" in DN.columns else "node_len"
-    DN = DN.sort_values(dist_out_col, ascending=False).copy()
-    DN["dist_m"] = DN[node_length_col].cumsum()
+    nodeWSE = open_SWOT_files(
+        D[["reach_id"]].copy(),
+        swot_node_dir,
+        swot_region,
+    )
 
-    if _feature_cols_need_wse(pelt_feature_cols):
-        nodeWSE = open_SWOT_files(
-            D[["reach_id"]].copy(),
-            swot_node_dir,
-            swot_region,
-        )
-        DN = DN.drop(columns=["wse"], errors="ignore")
-        DN = DN.merge(nodeWSE, how="left", on="node_id")
+    DN = DN.sort_values("hydro_dist_out", ascending=False).copy()
+    DN["dist_m"] = DN["node_length"].cumsum()
+
+    DN = DN.drop(columns=["wse"], axis=1)
+    DN = DN.merge(nodeWSE, how="left", on="node_id")
     return DN
-
-
-def _window_run_feasibility(nodes_df, cfg):
-    resolved_windows_m, window_selection_info = PELT.resolve_window_sizes(
-        nodes_df=nodes_df,
-        feat_cfg=PELT.FeatureConfig(dist_col="dist_m"),
-        window_cfg=cfg["window_selection"],
-    )
-    feasibility = PELT.summarize_window_feasibility(
-        nodes_df,
-        resolved_windows_m,
-        dist_col="dist_m",
-    )
-    return resolved_windows_m, window_selection_info, feasibility
-
-
-def _excluded_tuning_run_row(mip, run_key, cfg, window_selection_info, feasibility):
-    summary_df = feasibility["summary_df"].copy()
-    if summary_df.empty:
-        dropped_labels = []
-        dropped_windows_m = []
-        dropped_window_pts = []
-    else:
-        dropped = summary_df.loc[~summary_df["is_feasible"]].copy()
-        dropped_labels = dropped["window_label"].astype(str).tolist()
-        dropped_windows_m = dropped["window_m"].astype(float).tolist()
-        dropped_window_pts = dropped["window_pts"].astype(int).tolist()
-
-    if not feasibility["first_window_feasible"]:
-        exclusion_reason = "minimum_window_exceeds_reach"
-    else:
-        exclusion_reason = "partial_window_family_infeasible"
-
-    return {
-        "run_key": run_key,
-        "reach_id": mip,
-        "window_version": cfg["window_version"],
-        "window_method": str(window_selection_info.get("method", "unknown")),
-        "status": "excluded_from_tuning",
-        "exclusion_reason": exclusion_reason,
-        "n_nodes": int(feasibility["n_nodes"]),
-        "spacing_m": float(feasibility["spacing_m"]),
-        "n_windows_nominal": int(feasibility["n_windows_nominal"]),
-        "n_windows_feasible": int(feasibility["n_windows_feasible"]),
-        "n_windows_infeasible": int(feasibility["n_windows_infeasible"]),
-        "nominal_windows_m": list(feasibility["nominal_windows_m"]),
-        "feasible_windows_m": list(feasibility["feasible_windows_m"]),
-        "infeasible_windows_m": list(feasibility["infeasible_windows_m"]),
-        "dropped_window_labels": dropped_labels,
-        "dropped_window_pts": dropped_window_pts,
-        "width_lo_m": float(window_selection_info.get("width_lo_m", np.nan)),
-        "width_hi_m": float(window_selection_info.get("width_hi_m", np.nan)),
-        "raw_window_min_m": float(window_selection_info.get("raw_window_min_m", np.nan)),
-        "raw_window_max_m": float(window_selection_info.get("raw_window_max_m", np.nan)),
-    }
 
 
 def _run_single_window_job(
@@ -371,28 +309,14 @@ def _finalize_grid_outputs(
     settings_tables,
     consensus_tables,
     run_summary_tables,
-    excluded_run_rows,
     save_exports,
     outdir,
     consensus_cfg,
     pelt_feature_cols=("width_s", "nch_s"),
 ):
-    grid_settings_master_df = (
-        pd.concat(settings_tables, ignore_index=True)
-        if settings_tables
-        else pd.DataFrame()
-    )
-    grid_consensus_master_df = (
-        pd.concat(consensus_tables, ignore_index=True)
-        if consensus_tables
-        else pd.DataFrame()
-    )
-    grid_run_summary_master_df = (
-        pd.concat(run_summary_tables, ignore_index=True)
-        if run_summary_tables
-        else pd.DataFrame()
-    )
-    excluded_runs_df = pd.DataFrame(excluded_run_rows)
+    grid_settings_master_df = pd.concat(settings_tables, ignore_index=True)
+    grid_consensus_master_df = pd.concat(consensus_tables, ignore_index=True)
+    grid_run_summary_master_df = pd.concat(run_summary_tables, ignore_index=True)
     geometry_qa_rows = []
     geometry_nan_tables = []
     for run_key, result in results_dict.items():
@@ -415,8 +339,6 @@ def _finalize_grid_outputs(
         grid_settings_master_df.to_csv(outdir / "PELT_grid_settings_master.csv", index=False)
         grid_consensus_master_df.to_csv(outdir / "PELT_grid_consensus_master.csv", index=False)
         grid_run_summary_master_df.to_csv(outdir / "PELT_grid_run_summary_master.csv", index=False)
-        if not excluded_runs_df.empty:
-            excluded_runs_df.to_csv(outdir / "PELT_grid_excluded_runs.csv", index=False)
         if not geometry_qa_master_df.empty:
             geometry_qa_master_df.to_csv(outdir / "PELT_geometry_qa_master.csv", index=False)
         if not geometry_feature_nan_rates_master_df.empty:
@@ -434,7 +356,6 @@ def _finalize_grid_outputs(
         "grid_settings_master_df": grid_settings_master_df,
         "grid_consensus_master_df": grid_consensus_master_df,
         "grid_run_summary_master_df": grid_run_summary_master_df,
-        "excluded_runs_df": excluded_runs_df,
         "geometry_qa_master_df": geometry_qa_master_df,
         "geometry_feature_nan_rates_master_df": geometry_feature_nan_rates_master_df,
         "results_pickle_path": results_pickle_path,
@@ -571,11 +492,6 @@ def reapply_consensus_to_grid_outputs(
         settings_tables=settings_tables,
         consensus_tables=consensus_tables,
         run_summary_tables=run_summary_tables,
-        excluded_run_rows=(
-            grid_outputs.get("excluded_runs_df", pd.DataFrame()).to_dict("records")
-            if isinstance(grid_outputs.get("excluded_runs_df"), pd.DataFrame)
-            else list(grid_outputs.get("excluded_runs_df", []))
-        ),
         save_exports=save_exports,
         outdir=outdir,
         consensus_cfg=consensus_cfg,
@@ -672,7 +588,6 @@ def _PELT_grid_search_impl(
     settings_tables = []
     consensus_tables = []
     run_summary_tables = []
-    excluded_run_rows = []
 
     outdir = Path(outdir)
     if save_exports:
@@ -696,7 +611,6 @@ def _PELT_grid_search_impl(
                 df,
                 dfN,
                 mip,
-                pelt_feature_cols=pelt_feature_cols,
                 swot_node_dir=swot_node_dir,
                 swot_region=swot_region,
             )
@@ -713,22 +627,6 @@ def _PELT_grid_search_impl(
 
             if executor is None:
                 for window_key in selected_window_keys:
-                    cfg = window_runs[window_key]
-                    _, window_selection_info, feasibility = _window_run_feasibility(
-                        reach_nodes_df,
-                        cfg,
-                    )
-                    if bool(feasibility["any_infeasible"]):
-                        excluded_run_rows.append(
-                            _excluded_tuning_run_row(
-                                mip=mip,
-                                run_key=f"{mip}_{window_key}",
-                                cfg=cfg,
-                                window_selection_info=window_selection_info,
-                                feasibility=feasibility,
-                            )
-                        )
-                        continue
                     job_output = _run_single_window_job(
                         nodes_df=reach_nodes_df,
                         mip=mip,
@@ -754,53 +652,33 @@ def _PELT_grid_search_impl(
                         run_summary_tables,
                     )
             else:
-                future_map = {}
-                for window_key in selected_window_keys:
-                    cfg = window_runs[window_key]
-                    _, window_selection_info, feasibility = _window_run_feasibility(
+                future_map = {
+                    executor.submit(
+                        _run_single_window_job,
                         reach_nodes_df,
-                        cfg,
-                    )
-                    if bool(feasibility["any_infeasible"]):
-                        excluded_run_rows.append(
-                            _excluded_tuning_run_row(
-                                mip=mip,
-                                run_key=f"{mip}_{window_key}",
-                                cfg=cfg,
-                                window_selection_info=window_selection_info,
-                                feasibility=feasibility,
-                            )
-                        )
-                        continue
-
-                    future_map[
-                        executor.submit(
-                            _run_single_window_job,
-                            reach_nodes_df,
-                            mip,
-                            window_key,
-                            PELT_penalties,
-                            min_support_frac_runs_values,
-                            stop_rel_improvement_values,
-                            consensus_cfg,
-                            pelt_feature_cols,
-                            make_plots,
-                            print_timings,
-                            save_exports,
-                            outdir,
-                            centerline,
-                            geometry_feature_cfg,
-                            centerline_qa,
-                        )
-                    ] = window_key
+                        mip,
+                        window_key,
+                        PELT_penalties,
+                        min_support_frac_runs_values,
+                        stop_rel_improvement_values,
+                        consensus_cfg,
+                        pelt_feature_cols,
+                        make_plots,
+                        print_timings,
+                        save_exports,
+                        outdir,
+                        centerline,
+                        geometry_feature_cfg,
+                        centerline_qa,
+                    ): window_key
+                    for window_key in selected_window_keys
+                }
                 job_outputs_by_window = {}
                 for future in as_completed(future_map):
                     window_key = future_map[future]
                     job_outputs_by_window[window_key] = future.result()
 
                 for window_key in selected_window_keys:
-                    if window_key not in job_outputs_by_window:
-                        continue
                     _append_job_output(
                         job_outputs_by_window[window_key],
                         results_dict,
@@ -817,7 +695,6 @@ def _PELT_grid_search_impl(
         settings_tables=settings_tables,
         consensus_tables=consensus_tables,
         run_summary_tables=run_summary_tables,
-        excluded_run_rows=excluded_run_rows,
         save_exports=save_exports,
         outdir=outdir,
         consensus_cfg=consensus_cfg,
@@ -1432,8 +1309,6 @@ def run_tuning_analysis(
     run_summary_tables = []
 
     for run_key, result in results_dict.items():
-        if result.get("final_selection_grid", None) is None:
-            continue
         reach_id, window_version = infer_run_meta(run_key, result)
 
         settings_df, consensus_df, run_summary_df = PELT.extract_pelt_grid_analysis_tables(
@@ -1450,12 +1325,6 @@ def run_tuning_analysis(
         settings_tables.append(settings_df)
         consensus_tables.append(consensus_df)
         run_summary_tables.append(run_summary_df)
-
-    if not settings_tables:
-        raise ValueError(
-            "No valid tuning runs remain after window-feasibility exclusions. "
-            "Check PELT_grid_excluded_runs.csv or relax the window definition."
-        )
 
     settings = pd.concat(settings_tables, ignore_index=True)
     consensus = pd.concat(consensus_tables, ignore_index=True)
@@ -1670,8 +1539,6 @@ def run_tuning_analysis(
 
     threshold_rows = []
     for run_key, result in results_dict.items():
-        if result.get("final_selection_grid", None) is None:
-            continue
         reach_id, window_version = infer_run_meta(run_key, result)
         cons = result["final_selection_grid"].consensus.copy()
 

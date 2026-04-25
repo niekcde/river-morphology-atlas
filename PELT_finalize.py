@@ -31,6 +31,10 @@ def _feature_cols_need_geometry(pelt_feature_cols):
     return bool(set(PELT.normalize_feature_cols(pelt_feature_cols)) & {"sinu", "curv_int"})
 
 
+def _feature_cols_need_wse(pelt_feature_cols):
+    return "slope" in set(PELT.normalize_feature_cols(pelt_feature_cols))
+
+
 def _lookup_centerline(centerlines, mip, centerline_id_col="main_path_id", centerline_geometry_col="line"):
     if centerlines is None:
         return None
@@ -134,8 +138,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=2,
                 width_col="multi_width",
-                low_quantile=0.25,
-                high_quantile=0.75,
+                low_quantile=0.10,
+                high_quantile=0.90,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -149,8 +153,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=3,
                 width_col="multi_width",
-                low_quantile=0.25,
-                high_quantile=0.75,
+                low_quantile=0.10,
+                high_quantile=0.90,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -164,8 +168,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=4,
                 width_col="multi_width",
-                low_quantile=0.25,
-                high_quantile=0.75,
+                low_quantile=0.10,
+                high_quantile=0.90,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -179,8 +183,8 @@ def _build_window_runs():
                 method="width_quantile_log",
                 n_windows=5,
                 width_col="multi_width",
-                low_quantile=0.25,
-                high_quantile=0.75,
+                low_quantile=0.10,
+                high_quantile=0.90,
                 min_width_multiplier=36.0,
                 max_width_multiplier=36.0,
                 max_window_fraction_of_length=0.15,
@@ -290,22 +294,25 @@ def _prepare_reach_nodes(
     df,
     dfN,
     mip,
+    pelt_feature_cols=("width_s", "nch_s"),
     swot_node_dir=DEFAULT_SWOT_NODE_DIR,
     swot_region=DEFAULT_SWOT_REGION,
     ):
     D, DN = ims.run_code(df, mip, dfN)
 
-    nodeWSE = open_SWOT_files(
-        D[["reach_id"]].copy(),
-        swot_node_dir,
-        swot_region,
-    )
+    dist_out_col = "hydro_dist_out" if "hydro_dist_out" in DN.columns else "dist_out"
+    node_length_col = "node_length" if "node_length" in DN.columns else "node_len"
+    DN = DN.sort_values(dist_out_col, ascending=False).copy()
+    DN["dist_m"] = DN[node_length_col].cumsum()
 
-    DN = DN.sort_values("dist_out", ascending=False).copy()
-    DN["dist_m"] = DN["node_len"].cumsum()
-
-    DN = DN.drop(columns=["wse"], axis=1)
-    DN = DN.merge(nodeWSE, how="left", on="node_id")
+    if _feature_cols_need_wse(pelt_feature_cols):
+        nodeWSE = open_SWOT_files(
+            D[["reach_id"]].copy(),
+            swot_node_dir,
+            swot_region,
+        )
+        DN = DN.drop(columns=["wse"], errors="ignore")
+        DN = DN.merge(nodeWSE, how="left", on="node_id")
     return DN
 
 
@@ -333,12 +340,27 @@ def apply_explicit_selector_grid(
         raise ValueError("Specify either stable_support_frac_min or stable_support_count, not both.")
     if not selector_settings:
         raise ValueError("selector_settings must be non-empty.")
+    if str(results.get("run_status", "ok")) != "ok":
+        if not attach_to_results:
+            raise ValueError("Skipped base results can only be returned with attach_to_results=True.")
+        updated_results = dict(results)
+        updated_results["final_selection_grid"] = None
+        updated_results["stable_breaks_m"] = list(results.get("stable_breaks_m", []))
+        updated_results["stable_segments"] = list(results.get("stable_segments", []))
+        updated_results["final_selection_grid_meta"] = {
+            "status": str(results.get("run_status", "skipped")),
+            "reason": str(results.get("run_status_reason", "")),
+            "detail": str(results.get("run_status_detail", "")),
+            "selector_settings": [s.__dict__ for s in selector_settings],
+        }
+        return updated_results
     if stable_support_frac_min is None and stable_support_count is None:
         stable_support_count = default_final_stable_support_count(len(selector_settings))
 
     feature_cols_used = tuple(feature_cols) if feature_cols is not None else tuple(
         results.get("final_selection_feature_cols", PELT.FEATURE_COLS_ALL)
     )
+    n_windows_effective = max(int(len(results.get("standardized_by_window", {}))), 1)
 
     individual_results: Dict[str, PELT.BreakSelectionResult] = {}
     summary_rows: List[Dict[str, object]] = []
@@ -346,6 +368,7 @@ def apply_explicit_selector_grid(
 
     for setting in selector_settings:
         label = _selector_setting_label(setting)
+        min_windows_supported_effective = min(int(setting.min_windows_supported), n_windows_effective)
         try:
             sel = PELT.select_segment_breaks_from_results(
                 results=results,
@@ -354,7 +377,7 @@ def apply_explicit_selector_grid(
                 candidate_source=candidate_source,
                 candidate_freq_min=candidate_freq_min,
                 min_support_frac_runs=float(setting.min_support_frac_runs),
-                min_windows_supported=int(setting.min_windows_supported),
+                min_windows_supported=min_windows_supported_effective,
                 min_support_frac_windows=min_support_frac_windows,
                 stability_tolerance_m=stability_tolerance_m,
                 min_spacing_m=min_spacing_m,
@@ -372,6 +395,7 @@ def apply_explicit_selector_grid(
                     {
                         "setting": label,
                         "min_windows_supported": int(setting.min_windows_supported),
+                        "min_windows_supported_effective": int(min_windows_supported_effective),
                         "min_support_frac_runs": float(setting.min_support_frac_runs),
                         "stop_rel_improvement": float(setting.stop_rel_improvement),
                         "n_breaks": 0,
@@ -391,6 +415,7 @@ def apply_explicit_selector_grid(
             {
                 "setting": label,
                 "min_windows_supported": int(setting.min_windows_supported),
+                "min_windows_supported_effective": int(min_windows_supported_effective),
                 "min_support_frac_runs": float(setting.min_support_frac_runs),
                 "stop_rel_improvement": float(setting.stop_rel_improvement),
                 "n_breaks": int(len(sel.breaks_m)),
@@ -407,6 +432,7 @@ def apply_explicit_selector_grid(
                     "setting": label,
                     "break_m": float(b),
                     "min_windows_supported": int(setting.min_windows_supported),
+                    "min_windows_supported_effective": int(min_windows_supported_effective),
                     "min_support_frac_runs": float(setting.min_support_frac_runs),
                     "stop_rel_improvement": float(setting.stop_rel_improvement),
                 }
@@ -467,6 +493,7 @@ def apply_explicit_selector_grid(
         "stable_support_count": stable_support_count_effective,
         "stable_support_frac_min_effective": effective_support_frac,
         "n_settings_valid": n_settings_valid,
+        "n_windows_effective": n_windows_effective,
         "consensus_method": str(consensus_cfg.method),
         "merge_threshold_m": float(consensus_cfg.merge_threshold_m),
     }
@@ -499,6 +526,7 @@ def _run_base_reach_pipeline(
         df,
         dfN,
         mip,
+        pelt_feature_cols=pelt_feature_cols,
         swot_node_dir=swot_node_dir,
         swot_region=swot_region,
     )
@@ -572,6 +600,9 @@ def _finalize_base_result(
         consensus_cfg=consensus_cfg,
         attach_to_results=True,
     )
+
+    if str(final_results.get("run_status", "ok")) != "ok":
+        return final_results
 
     if make_plot:
         outdir = Path(outdir)
@@ -750,6 +781,7 @@ def run_final_batch(
     settings_tables = []
     consensus_tables = []
     run_summary_tables = []
+    skipped_run_rows = []
     geometry_qa_rows = []
     geometry_nan_tables = []
 
@@ -802,6 +834,20 @@ def run_final_batch(
         )
 
         results_dict[run_key] = result
+        if str(result.get("run_status", "ok")) != "ok":
+            skipped_run_rows.append(
+                {
+                    "run_key": run_key,
+                    "reach_id": mip,
+                    "window_version": window_version,
+                    "status": str(result.get("run_status", "skipped")),
+                    "reason": str(result.get("run_status_reason", "")),
+                    "detail": str(result.get("run_status_detail", "")),
+                    "nominal_windows_m": list(result.get("resolved_windows_m_nominal", ())),
+                    "feasible_windows_m": list(result.get("resolved_windows_m", ())),
+                }
+            )
+            continue
         if result.get("geometry_qa"):
             geometry_qa_rows.append({"run_key": run_key, **dict(result["geometry_qa"])})
         nan_rates = result.get("geometry_feature_nan_rates")
@@ -825,9 +871,22 @@ def run_final_batch(
         consensus_tables.append(consensus_df)
         run_summary_tables.append(run_summary_df)
 
-    grid_settings_master_df = pd.concat(settings_tables, ignore_index=True)
-    grid_consensus_master_df = pd.concat(consensus_tables, ignore_index=True)
-    grid_run_summary_master_df = pd.concat(run_summary_tables, ignore_index=True)
+    grid_settings_master_df = (
+        pd.concat(settings_tables, ignore_index=True)
+        if settings_tables
+        else pd.DataFrame()
+    )
+    grid_consensus_master_df = (
+        pd.concat(consensus_tables, ignore_index=True)
+        if consensus_tables
+        else pd.DataFrame()
+    )
+    grid_run_summary_master_df = (
+        pd.concat(run_summary_tables, ignore_index=True)
+        if run_summary_tables
+        else pd.DataFrame()
+    )
+    skipped_runs_df = pd.DataFrame(skipped_run_rows)
     geometry_qa_master_df = pd.DataFrame(geometry_qa_rows)
     geometry_feature_nan_rates_master_df = (
         pd.concat(geometry_nan_tables, ignore_index=True)
@@ -840,6 +899,8 @@ def run_final_batch(
         grid_settings_master_df.to_csv(outdir / "PELT_final_settings_master.csv", index=False)
         grid_consensus_master_df.to_csv(outdir / "PELT_final_consensus_master.csv", index=False)
         grid_run_summary_master_df.to_csv(outdir / "PELT_final_run_summary_master.csv", index=False)
+        if not skipped_runs_df.empty:
+            skipped_runs_df.to_csv(outdir / "PELT_final_skipped_runs.csv", index=False)
         if not geometry_qa_master_df.empty:
             geometry_qa_master_df.to_csv(outdir / "PELT_final_geometry_qa_master.csv", index=False)
         if not geometry_feature_nan_rates_master_df.empty:
@@ -857,6 +918,7 @@ def run_final_batch(
         "grid_settings_master_df": grid_settings_master_df,
         "grid_consensus_master_df": grid_consensus_master_df,
         "grid_run_summary_master_df": grid_run_summary_master_df,
+        "skipped_runs_df": skipped_runs_df,
         "geometry_qa_master_df": geometry_qa_master_df,
         "geometry_feature_nan_rates_master_df": geometry_feature_nan_rates_master_df,
         "results_pickle_path": results_pickle_path,
@@ -889,7 +951,31 @@ def summarize_final_batch(final_outputs):
     reach_rows = []
     for run_key, result in results_dict.items():
         grid = result.get("final_selection_grid", None)
+        run_status = str(result.get("run_status", "ok"))
         if grid is None:
+            reach_rows.append(
+                {
+                    "run_key": run_key,
+                    "reach_id": _infer_reach_id_from_run_key(run_key),
+                    "window_version": window_version,
+                    "run_status": run_status,
+                    "consensus_method": np.nan,
+                    "merge_threshold_m": np.nan,
+                    "merge_threshold_km": np.nan,
+                    "stable_support_count": np.nan,
+                    "stable_support_frac_effective": np.nan,
+                    "n_settings_valid": np.nan,
+                    "n_stable_breaks": 0,
+                    "has_stable_breaks": 0,
+                    "stable_breaks_m": [],
+                    "stable_breaks_km": [],
+                    "n_consensus_clusters": 0,
+                    "n_core_clusters": 0,
+                    "mean_core_span_km": np.nan,
+                    "max_core_span_km": np.nan,
+                    "mean_core_support": np.nan,
+                }
+            )
             continue
 
         meta = dict(result.get("final_selection_grid_meta", {}))
@@ -926,6 +1012,7 @@ def summarize_final_batch(final_outputs):
                 "run_key": run_key,
                 "reach_id": _infer_reach_id_from_run_key(run_key),
                 "window_version": window_version,
+                "run_status": run_status,
                 "consensus_method": consensus_method,
                 "merge_threshold_m": merge_threshold_m,
                 "merge_threshold_km": merge_threshold_m / 1000.0 if np.isfinite(merge_threshold_m) else np.nan,
@@ -948,28 +1035,47 @@ def summarize_final_batch(final_outputs):
     if reach_summary_df.empty:
         raise ValueError("No finalized reach results available to summarize.")
 
-    support_count_value = reach_summary_df["stable_support_count"].iloc[0]
+    finalized_rows = reach_summary_df[reach_summary_df["run_status"] == "ok"].copy()
+    support_count_value = (
+        finalized_rows["stable_support_count"].iloc[0]
+        if not finalized_rows.empty
+        else np.nan
+    )
     overall_summary_df = pd.DataFrame(
         [
             {
                 "window_version": window_version,
-                "consensus_method": str(reach_summary_df["consensus_method"].iloc[0]),
-                "merge_threshold_m": float(reach_summary_df["merge_threshold_m"].iloc[0]),
-                "merge_threshold_km": float(reach_summary_df["merge_threshold_km"].iloc[0]),
+                "consensus_method": (
+                    str(finalized_rows["consensus_method"].iloc[0])
+                    if not finalized_rows.empty
+                    else np.nan
+                ),
+                "merge_threshold_m": (
+                    float(finalized_rows["merge_threshold_m"].iloc[0])
+                    if not finalized_rows.empty
+                    else np.nan
+                ),
+                "merge_threshold_km": (
+                    float(finalized_rows["merge_threshold_km"].iloc[0])
+                    if not finalized_rows.empty
+                    else np.nan
+                ),
                 "stable_support_count": support_count_value,
-                "stable_support_frac_effective": float(reach_summary_df["stable_support_frac_effective"].mean()),
+                "stable_support_frac_effective": float(finalized_rows["stable_support_frac_effective"].mean()),
                 "reaches": int(len(reach_summary_df)),
+                "reaches_finalized": int(len(finalized_rows)),
+                "reaches_skipped": int((reach_summary_df["run_status"] != "ok").sum()),
                 "reaches_with_stable_breaks": int(reach_summary_df["has_stable_breaks"].sum()),
                 "frac_reaches_with_stable_breaks": float(reach_summary_df["has_stable_breaks"].mean()),
                 "total_stable_breaks": int(reach_summary_df["n_stable_breaks"].sum()),
                 "mean_n_stable_breaks": float(reach_summary_df["n_stable_breaks"].mean()),
                 "median_n_stable_breaks": float(reach_summary_df["n_stable_breaks"].median()),
-                "mean_n_consensus_clusters": float(reach_summary_df["n_consensus_clusters"].mean()),
-                "mean_n_core_clusters": float(reach_summary_df["n_core_clusters"].mean()),
-                "mean_core_span_km": float(reach_summary_df["mean_core_span_km"].mean()),
-                "mean_max_core_span_km": float(reach_summary_df["max_core_span_km"].mean()),
-                "mean_core_support": float(reach_summary_df["mean_core_support"].mean()),
-                "mean_n_settings_valid": float(reach_summary_df["n_settings_valid"].mean()),
+                "mean_n_consensus_clusters": float(finalized_rows["n_consensus_clusters"].mean()),
+                "mean_n_core_clusters": float(finalized_rows["n_core_clusters"].mean()),
+                "mean_core_span_km": float(finalized_rows["mean_core_span_km"].mean()),
+                "mean_max_core_span_km": float(finalized_rows["max_core_span_km"].mean()),
+                "mean_core_support": float(finalized_rows["mean_core_support"].mean()),
+                "mean_n_settings_valid": float(finalized_rows["n_settings_valid"].mean()),
             }
         ]
     )

@@ -878,6 +878,67 @@ def resolve_window_sizes(
     return windows, meta
 
 
+def window_pts_from_window_m(window_m: float, spacing_m: float) -> int:
+    if float(window_m) <= 0.0:
+        return 1
+    window_pts = int(np.round(float(window_m) / float(spacing_m)))
+    return max(window_pts, 3)
+
+
+def summarize_window_feasibility(
+    nodes_df: pd.DataFrame,
+    windows_m: Sequence[float],
+    dist_col: str = "dist_m",
+) -> Dict[str, object]:
+    require_cols(nodes_df, [dist_col])
+    df = ensure_sorted_by_dist(nodes_df, dist_col).reset_index(drop=True)
+    dist = df[dist_col].to_numpy(dtype=float)
+    spacing_m = infer_spacing_m(dist)
+    n_nodes = int(len(df))
+
+    rows: List[Dict[str, object]] = []
+    for order, window_m in enumerate(tuple(float(w) for w in windows_m)):
+        window_pts = window_pts_from_window_m(window_m, spacing_m)
+        is_feasible = bool(window_pts <= n_nodes)
+        rows.append(
+            {
+                "window_order": int(order),
+                "window_m": float(window_m),
+                "window_km": float(window_m) / 1000.0,
+                "window_label": window_label(float(window_m)),
+                "window_pts": int(window_pts),
+                "n_nodes": int(n_nodes),
+                "spacing_m": float(spacing_m),
+                "is_feasible": is_feasible,
+                "is_dropped": bool(not is_feasible),
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    feasible_windows_m = tuple(
+        float(v) for v in summary_df.loc[summary_df["is_feasible"], "window_m"].tolist()
+    )
+    infeasible_windows_m = tuple(
+        float(v) for v in summary_df.loc[~summary_df["is_feasible"], "window_m"].tolist()
+    )
+    first_window_feasible = bool(summary_df["is_feasible"].iloc[0]) if not summary_df.empty else False
+
+    return {
+        "summary_df": summary_df,
+        "spacing_m": float(spacing_m),
+        "n_nodes": int(n_nodes),
+        "nominal_windows_m": tuple(float(w) for w in windows_m),
+        "feasible_windows_m": feasible_windows_m,
+        "infeasible_windows_m": infeasible_windows_m,
+        "n_windows_nominal": int(len(windows_m)),
+        "n_windows_feasible": int(len(feasible_windows_m)),
+        "n_windows_infeasible": int(len(infeasible_windows_m)),
+        "any_infeasible": bool(len(infeasible_windows_m) > 0),
+        "all_infeasible": bool(len(feasible_windows_m) == 0),
+        "first_window_feasible": first_window_feasible,
+    }
+
+
 # =============================================================================
 # Feature building at 200 m nodes
 # =============================================================================
@@ -967,8 +1028,7 @@ def build_multiscale_features(
                 )
             window_pts = 1
         else:
-            window_pts = int(np.round(Wm / spacing))
-            window_pts = max(window_pts, 3)
+            window_pts = window_pts_from_window_m(float(Wm), spacing)
 
         fdf = pd.DataFrame({cfg.dist_col: dist})
         external_fdf = None
@@ -1969,7 +2029,7 @@ def run_full_pipeline(
 
     t0 = perf_counter()
     effective_window_cfg = get_effective_window_selection_config(pipe_cfg)
-    resolved_windows_m, window_selection_info = resolve_window_sizes(
+    resolved_windows_m_nominal, window_selection_info = resolve_window_sizes(
         nodes_df=nodes_df,
         feat_cfg=feat_cfg,
         window_cfg=effective_window_cfg,
@@ -1992,6 +2052,72 @@ def run_full_pipeline(
         prepared_nodes_df = ensure_sorted_by_dist(nodes_df.copy(), feat_cfg.dist_col).reset_index(drop=True)
         geom_df_used = geom_df_10m.copy() if geom_df_10m is not None else None
     timings["prepare_nodes"] = perf_counter() - t0
+
+    window_feasibility = summarize_window_feasibility(
+        prepared_nodes_df,
+        resolved_windows_m_nominal,
+        dist_col=feat_cfg.dist_col,
+    )
+    resolved_windows_m = tuple(window_feasibility["feasible_windows_m"])
+    window_selection_info = dict(window_selection_info)
+    window_selection_info["nominal_windows_m"] = tuple(window_feasibility["nominal_windows_m"])
+    window_selection_info["nominal_window_labels"] = [
+        window_label(w) for w in window_feasibility["nominal_windows_m"]
+    ]
+    window_selection_info["windows_m"] = resolved_windows_m
+    window_selection_info["window_labels"] = [window_label(w) for w in resolved_windows_m]
+    window_selection_info["n_windows_nominal"] = int(window_feasibility["n_windows_nominal"])
+    window_selection_info["n_windows_feasible"] = int(window_feasibility["n_windows_feasible"])
+    window_selection_info["dropped_windows_m"] = tuple(window_feasibility["infeasible_windows_m"])
+    window_selection_info["dropped_window_labels"] = [
+        window_label(w) for w in window_feasibility["infeasible_windows_m"]
+    ]
+
+    if not resolved_windows_m:
+        timings["total"] = perf_counter() - t_total
+        if pipe_cfg.print_timings:
+            print_timings(timings)
+        return {
+            "run_status": "skipped",
+            "run_status_reason": "no_feasible_windows",
+            "run_status_detail": (
+                "Resolved minimum window exceeds the feasible reach length / node count."
+                if not window_feasibility["first_window_feasible"]
+                else "Window selection produced no feasible windows for this reach."
+            ),
+            "nodes_used": prepared_nodes_df,
+            "geom_df_10m": geom_df_used,
+            "geometry_features_by_window": None,
+            "geometry_feature_diagnostics": {},
+            "geometry_feature_source": (
+                "PELT_geometry_features" if geometry_feature_cols else None
+            ),
+            "dist_col_used": feat_cfg.dist_col,
+            "width_col_used": feat_cfg.width_col,
+            "pelt_jump": pelt_cfg.jump,
+            "spacing_m": float(window_feasibility["spacing_m"]),
+            "window_selection": window_selection_info,
+            "window_feasibility": window_feasibility,
+            "resolved_windows_m": resolved_windows_m,
+            "resolved_windows_m_nominal": tuple(window_feasibility["nominal_windows_m"]),
+            "feature_cols_computed": feature_cols_to_compute,
+            "pelt_feature_cols": pelt_feature_cols,
+            "final_selection_feature_cols": break_feature_cols,
+            "features_by_window": {},
+            "standardized_by_window": {},
+            "zstats_by_window": {},
+            "per_window_runs": {},
+            "all_runs": [],
+            "stability": pd.DataFrame(),
+            "final_selection": None,
+            "final_breaks_m": [],
+            "final_segments": [(0, len(prepared_nodes_df))],
+            "final_selection_grid": None,
+            "final_selection_grid_meta": {},
+            "stable_breaks_m": [],
+            "stable_segments": [(0, len(prepared_nodes_df))],
+            "timings": timings,
+        }
 
     geometry_features_by_window = None
     geometry_feature_diagnostics = {}
@@ -2073,6 +2199,19 @@ def run_full_pipeline(
     timings["breakpoint_support"] = perf_counter() - t0
 
     spacing_m = infer_spacing_m(prepared_nodes_df[feat_cfg.dist_col].to_numpy(dtype=float))
+    n_windows_effective = int(len(standardized_by_window))
+    break_min_windows_supported_effective = min(
+        int(pipe_cfg.break_selection.min_windows_supported),
+        max(n_windows_effective, 1),
+    )
+    grid_min_windows_supported_values_effective = tuple(
+        sorted(
+            {
+                min(int(v), max(n_windows_effective, 1))
+                for v in pipe_cfg.break_selection_grid.min_windows_supported_values
+            }
+        )
+    ) if pipe_cfg.break_selection_grid.min_windows_supported_values else tuple()
 
     partial_results: Dict[str, object] = {
         "nodes_used": prepared_nodes_df,
@@ -2080,6 +2219,7 @@ def run_full_pipeline(
         "width_col_used": feat_cfg.width_col,
         "pelt_jump": pelt_cfg.jump,
         "spacing_m": spacing_m,
+        "window_feasibility": window_feasibility,
         "features_by_window": features_by_window,
         "standardized_by_window": standardized_by_window,
         "zstats_by_window": zstats_by_window,
@@ -2104,7 +2244,7 @@ def run_full_pipeline(
             candidate_source=pipe_cfg.break_selection.candidate_source,
             candidate_freq_min=pipe_cfg.break_selection.candidate_freq_min,
             min_support_frac_runs=pipe_cfg.break_selection.min_support_frac_runs,
-            min_windows_supported=pipe_cfg.break_selection.min_windows_supported,
+            min_windows_supported=break_min_windows_supported_effective,
             min_support_frac_windows=pipe_cfg.break_selection.min_support_frac_windows,
             stability_tolerance_m=pipe_cfg.break_selection.stability_tolerance_m,
             min_spacing_m=pipe_cfg.break_selection.min_spacing_m,
@@ -2128,7 +2268,7 @@ def run_full_pipeline(
             candidate_source=pipe_cfg.break_selection.candidate_source,
             candidate_freq_min=pipe_cfg.break_selection.candidate_freq_min,
             min_support_frac_runs_values=pipe_cfg.break_selection_grid.min_support_frac_runs_values,
-            min_windows_supported_values=pipe_cfg.break_selection_grid.min_windows_supported_values,
+            min_windows_supported_values=grid_min_windows_supported_values_effective,
             min_support_frac_windows=pipe_cfg.break_selection.min_support_frac_windows,
             stability_tolerance_m=pipe_cfg.break_selection.stability_tolerance_m,
             min_spacing_m=pipe_cfg.break_selection.min_spacing_m,
@@ -2150,6 +2290,9 @@ def run_full_pipeline(
         print_timings(timings)
 
     return {
+        "run_status": "ok",
+        "run_status_reason": "",
+        "run_status_detail": "",
         "nodes_used": prepared_nodes_df,
         "geom_df_10m": geom_df_used,
         "geometry_features_by_window": geometry_features_by_window,
@@ -2162,7 +2305,9 @@ def run_full_pipeline(
         "pelt_jump": pelt_cfg.jump,
         "spacing_m": spacing_m,
         "window_selection": window_selection_info,
+        "window_feasibility": window_feasibility,
         "resolved_windows_m": resolved_windows_m,
+        "resolved_windows_m_nominal": tuple(window_feasibility["nominal_windows_m"]),
         "feature_cols_computed": feature_cols_to_compute,
         "pelt_feature_cols": pelt_feature_cols,
         "final_selection_feature_cols": break_feature_cols,
@@ -2183,9 +2328,14 @@ def run_full_pipeline(
                 "stable_support_frac_min_effective": final_selection_grid.stable_support_frac_min,
                 "stable_support_count": final_selection_grid.stable_support_count,
                 "n_settings_valid": final_selection_grid.n_settings_valid,
+                "min_windows_supported_effective": break_min_windows_supported_effective,
+                "grid_min_windows_supported_values_effective": list(grid_min_windows_supported_values_effective),
             }
             if final_selection_grid is not None
-            else {}
+            else {
+                "min_windows_supported_effective": break_min_windows_supported_effective,
+                "grid_min_windows_supported_values_effective": list(grid_min_windows_supported_values_effective),
+            }
         ),
         "stable_breaks_m": stable_breaks_m,
         "stable_segments": stable_segments,
@@ -2674,9 +2824,17 @@ def extract_pelt_grid_analysis_tables(
 
     window_info = dict(results.get("window_selection", {}))
     resolved_windows_m = tuple(float(w) for w in results.get("resolved_windows_m", ()))
+    nominal_windows_m = tuple(
+        float(w) for w in window_info.get("nominal_windows_m", results.get("resolved_windows_m_nominal", resolved_windows_m))
+    )
     resolved_windows_km = [round(w / 1000.0, 6) for w in resolved_windows_m]
+    nominal_windows_km = [round(w / 1000.0, 6) for w in nominal_windows_m]
     window_labels = list(window_info.get("window_labels", [window_label(w) for w in resolved_windows_m]))
+    nominal_window_labels = list(
+        window_info.get("nominal_window_labels", [window_label(w) for w in nominal_windows_m])
+    )
     n_windows_total = int(len(window_labels))
+    n_windows_nominal = int(window_info.get("n_windows_nominal", len(nominal_window_labels)))
     window_method = str(window_info.get("method", "unknown"))
 
     if window_version is None:
@@ -2694,9 +2852,13 @@ def extract_pelt_grid_analysis_tables(
     settings_df["window_version"] = str(window_version)
     settings_df["window_method"] = window_method
     settings_df["n_windows_total"] = n_windows_total
+    settings_df["n_windows_nominal"] = n_windows_nominal
     settings_df["window_labels"] = [window_labels] * len(settings_df)
+    settings_df["nominal_window_labels"] = [nominal_window_labels] * len(settings_df)
     settings_df["resolved_windows_m"] = [list(resolved_windows_m)] * len(settings_df)
+    settings_df["nominal_windows_m"] = [list(nominal_windows_m)] * len(settings_df)
     settings_df["resolved_windows_km"] = [resolved_windows_km] * len(settings_df)
+    settings_df["nominal_windows_km"] = [nominal_windows_km] * len(settings_df)
     n_grid_settings_attempted_total = int(len(settings_df))
     n_grid_settings_valid_total = int((settings_df["status"].astype(str) == "ok").sum())
     settings_df["n_grid_settings_total"] = n_grid_settings_attempted_total
@@ -2720,9 +2882,13 @@ def extract_pelt_grid_analysis_tables(
     consensus_df["window_version"] = str(window_version)
     consensus_df["window_method"] = window_method
     consensus_df["n_windows_total"] = n_windows_total
+    consensus_df["n_windows_nominal"] = n_windows_nominal
     consensus_df["window_labels"] = [window_labels] * len(consensus_df)
+    consensus_df["nominal_window_labels"] = [nominal_window_labels] * len(consensus_df)
     consensus_df["resolved_windows_m"] = [list(resolved_windows_m)] * len(consensus_df)
+    consensus_df["nominal_windows_m"] = [list(nominal_windows_m)] * len(consensus_df)
     consensus_df["resolved_windows_km"] = [resolved_windows_km] * len(consensus_df)
+    consensus_df["nominal_windows_km"] = [nominal_windows_km] * len(consensus_df)
     consensus_df["n_grid_settings_total"] = n_grid_settings_attempted_total
     consensus_df["n_grid_settings_valid_total"] = n_grid_settings_valid_total
     consensus_df["n_grid_settings_failed_total"] = n_grid_settings_attempted_total - n_grid_settings_valid_total
@@ -2750,9 +2916,13 @@ def extract_pelt_grid_analysis_tables(
         "window_version": str(window_version),
         "window_method": window_method,
         "n_windows_total": n_windows_total,
+        "n_windows_nominal": n_windows_nominal,
         "window_labels": window_labels,
+        "nominal_window_labels": nominal_window_labels,
         "resolved_windows_m": list(resolved_windows_m),
+        "nominal_windows_m": list(nominal_windows_m),
         "resolved_windows_km": resolved_windows_km,
+        "nominal_windows_km": nominal_windows_km,
         "n_penalties_total": int(len(penalties)),
         "penalties": penalties,
         "n_grid_settings_total": n_grid_settings_attempted_total,

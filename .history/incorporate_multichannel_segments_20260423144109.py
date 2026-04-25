@@ -108,6 +108,7 @@ def edge_filtered_subgraph(G, pred):
     H = nx.MultiDiGraph()
     H.add_nodes_from(G.nodes(data=True))
     for u, v, k, d in G.edges(keys=True, data=True):
+        # print(d, pred(d))
         if pred(d):
             H.add_edge(u, v, key=k, **d)
     return H
@@ -135,11 +136,13 @@ def side_components(Gside: nx.MultiDiGraph, G:nx.MultiDiGraph) -> list[dict]:
     H.add_edges_from((u, v) for u, v, k in Gside.edges(keys=True))
 
     first_pass_components = [set(c) for c in nx.weakly_connected_components(H)]
+    # print(first_pass_components)
     comps = []
     for comp in first_pass_components:
         m = component_edge_count(G, comp)
         if m >= 2:
             comps.append(comp)
+            # print(len(comp), "nodes,", m, "side-edges")
     return comps
 
 ## ---------------------------------------------------------------------
@@ -458,7 +461,7 @@ def choose_source_sink_for_component(Gside_sub: nx.MultiDiGraph, component_nodes
     if not splits or not merges:
         return None, None, {"touched_main": touched, "splits": splits, "merges": merges}
 
-    source = min(splits, key=lambda n: main_idx[n])
+    source = max(splits, key=lambda n: main_idx[n])
     merges_ds = [m for m in merges if main_idx[m] > main_idx[source]]
     if not merges_ds:
         return None, None, {"touched_main": touched, "splits": splits, "merges": merges}
@@ -636,7 +639,7 @@ def analyze_component_total_channels(
 
     width_of = reach_width_lookup(Rcorr, width_attr="width")  # change to your column name
     W_dom  = summarize_width(dom_side_set, width_of, len_of=len_of, stat="median", weighted=False)
-
+    # print(W_dom)
     extra_set = set(len_of.keys()) - covered
     if len(extra_set) == 0:
         W_extra = 0
@@ -678,7 +681,8 @@ def analyze_component_total_channels(
     }
 
 def run_code(dfG, mpi, df_node):
-    """Current code based on 17c parquet files"""
+    # print('Current code expects rch_id_dn column to be made up of: "[]" for missing values an empty list.\
+    #       If different dataframe is supplied change first lines of run_code()')
 
     # filter input dataframe
     D       = dfG.loc[(dfG['main_path_id'] == mpi)].copy()
@@ -697,8 +701,7 @@ def run_code(dfG, mpi, df_node):
 
     # Get ordering main channel
     main_nodes, main_idx = get_main_order(Gmain)
-    
-
+    print(comps[5])
     # compute additional number of channels and widths for side channel componentns
     results = []
     for i, comp in enumerate(comps):  # comps = side_components(Gside)
@@ -727,7 +730,6 @@ def run_code(dfG, mpi, df_node):
 
     cols = ['k_eff', 'k_max', 'width_extra', 'k_eff_raw']
     for res in results:
-
         D.loc[D['reach_id'].isin(res['main_reach_ids']), cols] = [
                 res[c] for c in cols]
     if len(results) == 0:
@@ -737,7 +739,6 @@ def run_code(dfG, mpi, df_node):
     df_node = df_node[df_node['reach_id'].isin(D['reach_id'])]
 
     nchanNode = df_node.groupby('reach_id', as_index = False)['n_chan_mod'].mean()
-    
     nchanNode = nchanNode.rename(columns = {'n_chan_mod':'multi_n_chan'})
 
 

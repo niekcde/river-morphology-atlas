@@ -364,6 +364,8 @@ def _run_stage_on_prepared_nodes(
         centerline=centerline,
         geometry_feature_cfg=geometry_feature_cfg,
     )
+    if str(base_result.get("run_status", "ok")) != "ok":
+        return base_result
     return pf.apply_explicit_selector_grid(
         results=base_result,
         selector_settings=selector_settings,
@@ -399,6 +401,30 @@ def run_two_stage_final_batch(
 
     for mip in mips:
         stage1_run_key, stage1_result = _find_result_for_mip(stage1_outputs, mip)
+        if str(stage1_result.get("run_status", "ok")) != "ok":
+            run_key = f"{mip}_two_stage"
+            results_dict[run_key] = {
+                "stage1_run_key": stage1_run_key,
+                "run_status": "skipped",
+                "run_status_reason": "stage1_not_segmentable",
+                "run_status_detail": str(stage1_result.get("run_status_detail", "")),
+                "stable_breaks_m": [],
+                "stable_segments": [],
+            }
+            summary_rows.append(
+                {
+                    "run_key": run_key,
+                    "mip": mip,
+                    "status": "skipped",
+                    "reason": "stage1_not_segmentable",
+                    "n_stage1_breaks": 0,
+                    "n_stage2_breaks": 0,
+                    "n_stable_breaks": 0,
+                    "stable_breaks_m": [],
+                    "stable_breaks_km": [],
+                }
+            )
+            continue
         nodes = stage1_result["nodes_used"].sort_values("dist_m").reset_index(drop=True)
         global_dist = nodes["dist_m"].to_numpy(dtype=float)
         stage1_breaks = [float(v) for v in stage1_result.get("stable_breaks_m", [])]
@@ -474,12 +500,14 @@ def run_two_stage_final_batch(
             local_breaks = [float(v) for v in stage2_result.get("stable_breaks_m", [])]
             global_breaks = [offset_m + v for v in local_breaks]
             stage2_breaks_global.extend(global_breaks)
+            segment_status = str(stage2_result.get("run_status", "ok"))
             segment_results.append(
                 {
                     "segment_id": segment_id,
                     "node_slice": (a, b),
                     "offset_m": offset_m,
                     "end_m": end_m,
+                    "status": segment_status,
                     "local_result": stage2_result,
                     "local_breaks_m": local_breaks,
                     "global_breaks_m": global_breaks,
@@ -490,7 +518,7 @@ def run_two_stage_final_batch(
                     "mip": mip,
                     "stage1_run_key": stage1_run_key,
                     "segment_id": segment_id,
-                    "status": "ok",
+                    "status": segment_status,
                     "n_nodes": int(b - a),
                     "n_stage2_breaks": int(len(global_breaks)),
                     "stage2_breaks_m": global_breaks,
@@ -515,6 +543,7 @@ def run_two_stage_final_batch(
             {
                 "run_key": run_key,
                 "mip": mip,
+                "status": "ok",
                 "n_stage1_breaks": int(len(stage1_breaks)),
                 "n_stage2_breaks": int(len(stage2_breaks_global)),
                 "n_stable_breaks": int(len(combined_breaks)),
