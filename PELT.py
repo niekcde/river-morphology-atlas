@@ -2375,7 +2375,7 @@ def compare_pelt_results(results_compare, tol_m=2000, make_plot=True, plot_title
         plt.tight_layout()
         
         outdir = Path("test_figures")
-        outdir.mkdir(exist_ok=True)
+        outdir.mkdir(exist_ok=True, parents=True)
         fname = outdir / f"PELT_config_{plot_title}"
 
         summary_df.to_csv(f'{fname}_summary_df.csv')
@@ -2588,7 +2588,7 @@ def plot_pelt_grid_results(
 
         if save:
             outdir = Path(outdir)
-            outdir.mkdir(exist_ok=True)
+            outdir.mkdir(exist_ok=True, parents=True)
 
             suffix = f"_{plot_title}" if plot_title else ""
             stem = outdir / f"PELT_grid{suffix}"

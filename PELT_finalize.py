@@ -576,7 +576,7 @@ def _finalize_base_result(
     if make_plot:
         outdir = Path(outdir)
         if save_exports:
-            outdir.mkdir(exist_ok=True)
+            outdir.mkdir(exist_ok=True, parents=True)
         PELT.plot_pelt_grid_results(
             final_results,
             core_min=float(final_results["final_selection_grid"].stable_support_frac_min),
@@ -744,7 +744,7 @@ def run_final_batch(
 
     outdir = Path(outdir)
     if save_exports:
-        outdir.mkdir(exist_ok=True)
+        outdir.mkdir(exist_ok=True, parents=True)
 
     results_dict = {}
     settings_tables = []
@@ -1010,7 +1010,7 @@ def run_final_support_sweep(
 
     outdir = Path(outdir)
     if save_exports:
-        outdir.mkdir(exist_ok=True)
+        outdir.mkdir(exist_ok=True, parents=True)
 
     base_run_outputs = build_base_results_batch(
         df=df,

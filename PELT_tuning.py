@@ -591,7 +591,7 @@ def _PELT_grid_search_impl(
 
     outdir = Path(outdir)
     if save_exports:
-        outdir.mkdir(exist_ok=True)
+        outdir.mkdir(exist_ok=True, parents=True)
 
     selected_window_keys = _select_window_keys(input_windows, window_runs)
 
