@@ -14,10 +14,11 @@ import PELT_geometry_features as pgf
 import PELT_segmentation_runner as psr
 
 
-NOTEBOOK_REFERENCE_MIPS = [
-    680, 560, 1951, 2540, 1094, 2509, 381, 30, 35, 3247, 2957, 1033,
-    1171, 1147, 113, 1788, 539, 2244, 2947, 236, 1378, 2443, 1617,
-    659, 599, 2206, 2202, 1,
+DEFAULT_NOTEBOOK_MIPS = [
+    6000007, 6000009, 6000034, 6000041, 6000053, 6000084, 6000092,
+    6000141, 6000148, 6000152, 6000212, 6000217, 6000249, 6000279,
+    6000282, 6000287, 6000297, 6000318, 6000323, 6000344, 6000399,
+    6000436, 6000560, 6000573, 6000622, 6000678, 6001070, 6001096,
 ]
 
 DEFAULT_PENALTIES = (2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0)
@@ -43,27 +44,6 @@ def _load_mips_from_file(path: Path) -> list[int]:
             raise ValueError(f"Expected JSON list in {path}")
         return [int(v) for v in values]
     return _parse_int_list(raw.replace("\n", ","))
-
-
-def _resolve_notebook_reference_mips(df_reaches, check_edges_path: Path, continent: str) -> list[int]:
-    dfcheck = gpd.read_file(check_edges_path)
-    mask = dfcheck["continent"].astype(str).str.lower() == continent.lower()
-    dfcheckc = dfcheck.loc[mask].copy()
-
-    resolved = []
-    for mip in NOTEBOOK_REFERENCE_MIPS:
-        reach_ids = dfcheckc.loc[dfcheckc["main_path_id"] == mip, "reach_id"].to_list()
-        if not reach_ids:
-            raise ValueError(f"Could not map notebook reference main_path_id {mip} using {check_edges_path}")
-        main_paths = df_reaches.loc[df_reaches["reach_id"] == reach_ids[0], "main_path_id"]
-        if main_paths.empty:
-            raise ValueError(f"Mapped reach_id {reach_ids[0]} for notebook reference {mip} not found in reaches")
-        resolved.append(int(main_paths.iloc[0]))
-
-    # Preserve the manual notebook correction exactly.
-    if len(resolved) > 16:
-        resolved[16] = 6000084
-    return resolved
 
 
 def _jsonify(value):
@@ -105,20 +85,15 @@ def _load_inputs(sword_dir: Path, continent: str):
     return dfG, dfN, reaches_path, nodes_path
 
 
-def _choose_mips(args, dfG) -> list[int]:
+def _choose_mips(args) -> list[int]:
     if args.mips_csv:
         return _parse_int_list(args.mips_csv)
     if args.mips_file:
         return _load_mips_from_file(Path(args.mips_file))
-    check_edges_path = Path(args.check_edges_path)
-    return _resolve_notebook_reference_mips(
-        df_reaches=dfG,
-        check_edges_path=check_edges_path,
-        continent=args.continent.lower(),
-    )
+    return list(DEFAULT_NOTEBOOK_MIPS)
 
 
-def _build_centerlines(dfG, mips: Iterable[int], outdir: Path):
+def _build_centerlines(dfG, mips: Iterable[int], outdir: Path, use_duckdb_spatial: bool):
     centerlines_path = outdir / "_shared" / "centerlines.parquet"
     return psr.build_centerlines_from_edges(
         dfG[dfG["main_path_id"].isin(list(mips))],
@@ -127,6 +102,7 @@ def _build_centerlines(dfG, mips: Iterable[int], outdir: Path):
         endpoint_gap_tol=160,
         endpoint_gap_connected_tol=1e-6,
         graph_union_grid_size=1e-4,
+        use_duckdb_spatial=use_duckdb_spatial,
     )
 
 
@@ -184,33 +160,36 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--sword-dir", required=True, help="Directory containing SWORD v17c parquet inputs.")
-    parser.add_argument(
-        "--check-edges-path",
-        default=None,
-        help="Path to check/global_edges.gpkg used to reproduce the notebook reference MIP mapping.",
-    )
     parser.add_argument("--swot-node-dir", default="", help="SWOT node directory. Unused for the current feature sets.")
     parser.add_argument("--swot-region", default="SA")
     parser.add_argument("--continent", default="SA")
     parser.add_argument("--outdir", default="PELT_outputs")
     parser.add_argument("--mips-csv", default="", help="Comma-separated main_path_id list to run.")
-    parser.add_argument("--mips-file", default="", help="Optional file containing MIPs as JSON list or CSV/text.")
+    parser.add_argument(
+        "--mips-file",
+        default="",
+        help="Optional file containing MIPs as JSON list or CSV/text. "
+        "If omitted, the script uses the current 28-MIP notebook list directly.",
+    )
     parser.add_argument("--parallel-tuning", action="store_true")
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--min-segment-nodes", type=int, default=10)
+    parser.add_argument(
+        "--use-duckdb-centerline-merge",
+        action="store_true",
+        help="Use DuckDB spatial for centerline ST_Collect/ST_LineMerge. "
+        "Default is the shapely merge path, which avoids DuckDB spatial extension issues on HPC.",
+    )
     args = parser.parse_args()
 
     sword_dir = Path(args.sword_dir)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    if not args.check_edges_path:
-        args.check_edges_path = str(sword_dir / "check" / "global_edges.gpkg")
-
     print("Loading inputs...")
     dfG, dfN, reaches_path, nodes_path = _load_inputs(sword_dir, args.continent)
-    mips = _choose_mips(args, dfG)
+    mips = _choose_mips(args)
     print(f"Loaded {len(dfG)} reaches and {len(dfN)} nodes.")
     print(f"Running {len(mips)} MIPs.")
 
@@ -218,7 +197,6 @@ def main() -> None:
         "sword_dir": sword_dir,
         "reaches_path": reaches_path,
         "nodes_path": nodes_path,
-        "check_edges_path": Path(args.check_edges_path),
         "swot_node_dir": args.swot_node_dir,
         "swot_region": args.swot_region,
         "continent": args.continent,
@@ -234,12 +212,18 @@ def main() -> None:
             "endpoint_gap_tol": 160,
             "endpoint_gap_connected_tol": 1e-6,
             "graph_union_grid_size": 1e-4,
+            "use_duckdb_spatial": args.use_duckdb_centerline_merge,
         },
     }
     _save_json(manifest, outdir / "workflow_manifest.json")
 
     print("Building centerlines once for all geometry-based runs...")
-    centerlines, centerline_qa = _build_centerlines(dfG, mips, outdir)
+    centerlines, centerline_qa = _build_centerlines(
+        dfG,
+        mips,
+        outdir,
+        use_duckdb_spatial=args.use_duckdb_centerline_merge,
+    )
     geometry_feature_cfg = pgf.GeometryFeatureConfig(
         dist_col="dist_m",
         width_col="multi_width",

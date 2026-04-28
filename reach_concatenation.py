@@ -1,7 +1,6 @@
 import geopandas as gpd
 import networkx as nx
 import shapely
-import duckdb
 import pandas as pd
 import numpy as np
 import os
@@ -10,8 +9,13 @@ from collections import defaultdict
 
 from shapely import wkt
 from shapely.geometry import Point, LineString, MultiLineString
-from shapely.ops import unary_union
+from shapely.ops import unary_union, linemerge
 from tqdm import tqdm
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
 
 
 def _set_endpoint(ls: LineString, which: str, p: Point) -> LineString:
@@ -179,38 +183,219 @@ def _choose_outer_endpoint(candidates, parts):
     )
 
 
-def _select_global_terminal_endpoints(parts, loose_records):
-    """
-    Use MultiLineString part order to identify the two expected outer terminals.
+def _endpoint_record_key(record):
+    return (record["part_id"], record["which"])
 
-    This assumes the parts produced by line_merge are ordered along the main path.
-    The selected endpoints are removed from the large-gap search because they are
-    valid loose ends of the full path, not internal gaps.
-    """
-    if len(parts) < 2:
+
+def _endpoint_record_node_key(record, node_tol: float = 1e-6):
+    return _node_key((record["endpoint"].x, record["endpoint"].y), node_tol=node_tol)
+
+
+def _select_global_terminal_endpoints_from_terminal_points(
+    loose_records,
+    terminal_points,
+    match_tol: float,
+):
+    if not terminal_points or not loose_records:
         return []
 
-    first_part_id = 0
-    last_part_id = len(parts) - 1
-    first_candidates = [
+    selected = []
+    used_keys = set()
+    for point in terminal_points[:2]:
+        if point is None:
+            continue
+        best = None
+        best_distance = float("inf")
+        for record in loose_records:
+            key = _endpoint_record_key(record)
+            if key in used_keys:
+                continue
+            distance = point.distance(record["endpoint"])
+            if distance <= match_tol and distance < best_distance:
+                best = record
+                best_distance = distance
+        if best is not None:
+            selected.append(best)
+            used_keys.add(_endpoint_record_key(best))
+    return selected
+
+
+def _select_global_terminal_endpoints_from_graph(
+    parts,
+    loose_records,
+    node_tol: float = 1e-6,
+):
+    if len(loose_records) < 2:
+        return []
+
+    graph = _line_piece_graph_from_lines(parts, node_tol=node_tol)
+    if graph.number_of_nodes() < 2:
+        return []
+
+    terminal_nodes = [node for node, degree in graph.degree() if degree == 1]
+    if len(terminal_nodes) < 2:
+        return []
+
+    node_to_record = {}
+    for record in loose_records:
+        node_key = _endpoint_record_node_key(record, node_tol=node_tol)
+        if node_key in terminal_nodes and node_key not in node_to_record:
+            node_to_record[node_key] = record
+
+    terminal_candidate_nodes = list(node_to_record)
+    if len(terminal_candidate_nodes) < 2:
+        return []
+
+    component_id_by_node = {}
+    for component_id, component_nodes in enumerate(nx.connected_components(graph)):
+        for node in component_nodes:
+            component_id_by_node[node] = component_id
+    candidate_component_ids = {
+        component_id_by_node.get(node)
+        for node in terminal_candidate_nodes
+    }
+
+    # If the loose terminal candidates span multiple disconnected components,
+    # graph path length is not the right ranking metric. In that case, use the
+    # outermost graph-terminal pair geometrically.
+    if len(candidate_component_ids) > 1:
+        best_records = None
+        best_distance = -1.0
+        terminal_records = [node_to_record[node] for node in terminal_candidate_nodes]
+        for i, left in enumerate(terminal_records):
+            for right in terminal_records[i + 1:]:
+                distance = left["endpoint"].distance(right["endpoint"])
+                if distance > best_distance:
+                    best_records = (left, right)
+                    best_distance = float(distance)
+        if best_records is None:
+            return []
+        return [best_records[0], best_records[1]]
+
+    best_pair = None
+    best_length = -1.0
+    for i, source_candidate in enumerate(terminal_candidate_nodes):
+        lengths = nx.single_source_dijkstra_path_length(
+            graph,
+            source_candidate,
+            weight="length",
+        )
+        for target_candidate in terminal_candidate_nodes[i + 1:]:
+            length = lengths.get(target_candidate)
+            if length is not None and length > best_length:
+                best_pair = (source_candidate, target_candidate)
+                best_length = float(length)
+
+    if best_pair is not None:
+        return [node_to_record[best_pair[0]], node_to_record[best_pair[1]]]
+
+    # Disconnected components can still expose valid outer terminals; in that
+    # case, use the two graph-terminal endpoint records with the greatest
+    # Euclidean separation as a last graph-derived fallback.
+    best_records = None
+    best_distance = -1.0
+    terminal_records = [node_to_record[node] for node in terminal_candidate_nodes]
+    for i, left in enumerate(terminal_records):
+        for right in terminal_records[i + 1:]:
+            distance = left["endpoint"].distance(right["endpoint"])
+            if distance > best_distance:
+                best_records = (left, right)
+                best_distance = float(distance)
+    if best_records is None:
+        return []
+    return [best_records[0], best_records[1]]
+
+
+def _select_global_terminal_endpoints_farthest_pair(loose_records):
+    if len(loose_records) < 2:
+        return list(loose_records[:1])
+
+    best_pair = None
+    best_distance = -1.0
+    for i, left in enumerate(loose_records):
+        for right in loose_records[i + 1:]:
+            distance = left["endpoint"].distance(right["endpoint"])
+            if distance > best_distance:
+                best_pair = (left, right)
+                best_distance = float(distance)
+    if best_pair is None:
+        return []
+    return [best_pair[0], best_pair[1]]
+
+
+def _select_global_terminal_endpoints(
+    parts,
+    loose_records,
+    terminal_points=None,
+    node_tol: float = 1e-6,
+    match_tol: float = 1e-6,
+):
+    """
+    Identify the expected outer terminals without relying on MultiLineString part
+    ordering, which can differ between geometry backends.
+
+    Priority:
+      1. Match to ordered-reach terminal points when available.
+      2. Use graph terminal nodes derived from the merged line parts.
+      3. Fall back to the farthest loose endpoint pair geometrically.
+    """
+    if len(parts) < 2 or not loose_records:
+        return [], "none"
+
+    selected = []
+    used_keys = set()
+
+    matched_records = _select_global_terminal_endpoints_from_terminal_points(
+        loose_records,
+        terminal_points=terminal_points,
+        match_tol=match_tol,
+    )
+    if matched_records:
+        for record in matched_records:
+            key = _endpoint_record_key(record)
+            if key in used_keys:
+                continue
+            selected.append(record)
+            used_keys.add(key)
+        if len(selected) >= 2:
+            return selected[:2], "ordered_reach_terminals"
+
+    remaining_loose_records = [
         record for record in loose_records
-        if record["part_id"] == first_part_id
+        if _endpoint_record_key(record) not in used_keys
     ]
-    last_candidates = [
-        record for record in loose_records
-        if record["part_id"] == last_part_id
-    ]
+    graph_records = _select_global_terminal_endpoints_from_graph(
+        parts,
+        remaining_loose_records if remaining_loose_records else loose_records,
+        node_tol=node_tol,
+    )
+    if graph_records:
+        for record in graph_records:
+            key = _endpoint_record_key(record)
+            if key in used_keys:
+                continue
+            selected.append(record)
+            used_keys.add(key)
+        if len(selected) >= 2:
+            method = "ordered_reach_terminals+graph_terminals" if matched_records else "graph_terminals"
+            return selected[:2], method
 
-    terminals = []
-    first = _choose_outer_endpoint(first_candidates, parts)
-    last = _choose_outer_endpoint(last_candidates, parts)
+    farthest_records = _select_global_terminal_endpoints_farthest_pair(
+        remaining_loose_records if remaining_loose_records else loose_records
+    )
+    for record in farthest_records:
+        key = _endpoint_record_key(record)
+        if key in used_keys:
+            continue
+        selected.append(record)
+        used_keys.add(key)
+        if len(selected) >= 2:
+            break
 
-    if first is not None:
-        terminals.append(first)
-    if last is not None and (last["part_id"], last["which"]) != (first["part_id"], first["which"]):
-        terminals.append(last)
-
-    return terminals
+    if not selected:
+        return [], "none"
+    method = "ordered_reach_terminals+geometric_fallback" if matched_records else "geometric_fallback"
+    return selected[:2], method
 
 
 def snap_close_endpoint_gaps(
@@ -221,6 +406,9 @@ def snap_close_endpoint_gaps(
     exclude_global_terminals: bool = True,
     snap_endpoint_to_line: bool = True,
     include_endpoint_diagnostics: bool = False,
+    terminal_points=None,
+    global_terminal_node_tol: float = 1e-6,
+    global_terminal_match_tol=None,
     return_diagnostics: bool = False,
 ):
     """
@@ -239,7 +427,7 @@ def snap_close_endpoint_gaps(
         "protected_endpoint_reasons": {},
         "loose_endpoint_count": 0,
         "global_terminal_endpoint_count": 0,
-        "global_terminal_method": "part_order",
+        "global_terminal_method": None,
         "unresolved_endpoint_count": 0,
         "candidate_pair_count": 0,
         "endpoint_line_candidate_count": 0,
@@ -283,7 +471,7 @@ def snap_close_endpoint_gaps(
     protected = defaultdict(set)
 
     def endpoint_key(record):
-        return (record["part_id"], record["which"])
+        return _endpoint_record_key(record)
 
     def protect(record, reason):
         protected[endpoint_key(record)].add(reason)
@@ -355,11 +543,19 @@ def snap_close_endpoint_gaps(
     diagnostics["loose_endpoint_count"] = len(loose_records)
 
     global_terminal_records = []
+    global_terminal_method = "disabled"
     if exclude_global_terminals:
-        global_terminal_records = _select_global_terminal_endpoints(
+        match_tol = global_terminal_match_tol
+        if match_tol is None:
+            match_tol = max(float(global_terminal_node_tol) * 10.0, float(connected_tol), 1e-6)
+        global_terminal_records, global_terminal_method = _select_global_terminal_endpoints(
             parts,
             loose_records,
+            terminal_points=terminal_points,
+            node_tol=global_terminal_node_tol,
+            match_tol=match_tol,
         )
+    diagnostics["global_terminal_method"] = global_terminal_method
     global_terminal_keys = {
         endpoint_key(record)
         for record in global_terminal_records
@@ -1292,9 +1488,27 @@ def extract_main_path_from_graph(
     return finish(resolved)
 
 
-def merge_lines(gdf):
+def _merge_lines_shapely(gdf):
+    parts = [geom for geom in gdf["geometry"].tolist() if geom is not None and not geom.is_empty]
+    if not parts:
+        raise ValueError("merge_lines received no non-empty geometries.")
+    return linemerge(unary_union(parts))
+
+
+def _merge_lines_duckdb(gdf):
+    if duckdb is None:
+        raise ImportError(
+            "duckdb is not installed. Use use_duckdb_spatial=False to fall back to the shapely merge path."
+        )
+
     con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
+    try:
+        con.execute("INSTALL spatial; LOAD spatial;")
+    except Exception as exc:
+        raise RuntimeError(
+            "DuckDB spatial could not be loaded. "
+            "Use use_duckdb_spatial=False to fall back to the shapely merge path."
+        ) from exc
 
     # -----------------------------
     # 1. Keep ONLY mainstem edges
@@ -1329,6 +1543,12 @@ def merge_lines(gdf):
     return  merged["merged_wkt"].apply(wkt.loads).iloc[0]
 
 
+def merge_lines(gdf, use_duckdb_spatial: bool = True):
+    if use_duckdb_spatial:
+        return _merge_lines_duckdb(gdf)
+    return _merge_lines_shapely(gdf)
+
+
 def merge_mainpaths(
     df,
     dfG_or_mainstem_col=None,
@@ -1351,6 +1571,7 @@ def merge_mainpaths(
     graph_union_grid_size: float = 1e-6,
     graph_terminal_snap_tol=None,
     graph_max_input_vertices=250000,
+    use_duckdb_spatial: bool = True,
     return_diagnostics: bool = False,
 ):
     if isinstance(dfG_or_mainstem_col, str):
@@ -1377,7 +1598,13 @@ def merge_mainpaths(
         reach_ids_list = reach_ids.tolist()
         input_geom_length = float(rows.geometry.length.sum())
 
-        l = merge_lines(rows)
+        main_path_terminal_points, terminal_diagnostics = terminal_points_from_reach_order(
+            rows,
+            order_col=terminal_order_col,
+            reach_id_col=reach_id_col,
+            return_diagnostics=True,
+        )
+        l = merge_lines(rows, use_duckdb_spatial=use_duckdb_spatial)
         endpoint_gap_diagnostics = None
         if snap_endpoint_gaps:
             l, endpoint_gap_diagnostics = snap_close_endpoint_gaps(
@@ -1388,6 +1615,8 @@ def merge_mainpaths(
                 exclude_global_terminals=exclude_global_terminal_gaps,
                 snap_endpoint_to_line=snap_endpoint_to_line_gaps,
                 include_endpoint_diagnostics=include_endpoint_gap_points,
+                terminal_points=main_path_terminal_points,
+                global_terminal_node_tol=graph_node_tol,
                 return_diagnostics=True,
             )
 
@@ -1401,12 +1630,6 @@ def merge_mainpaths(
                 return_diagnostics=True,
             )
 
-        main_path_terminal_points, terminal_diagnostics = terminal_points_from_reach_order(
-            rows,
-            order_col=terminal_order_col,
-            reach_id_col=reach_id_col,
-            return_diagnostics=True,
-        )
         l, graph_path_diagnostics = extract_main_path_from_graph(
             l,
             terminal_points=main_path_terminal_points,
