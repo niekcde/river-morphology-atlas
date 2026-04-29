@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 import pickle
@@ -602,6 +603,8 @@ def calibrate_and_reapply_consensus_to_grid_outputs(
     round_to_km=0.5,
     require_all_target_families=False,
     min_plateau_families=3,
+    fallback_min_plateau_families=2,
+    fallback_to_frozen_default=True,
     stable_support_frac_min=None,
 ):
     """
@@ -611,23 +614,92 @@ def calibrate_and_reapply_consensus_to_grid_outputs(
     outdir = Path(outdir) if outdir is not None else _infer_grid_output_outdir(grid_outputs)
     calibration_outdir = Path(calibration_outdir) if calibration_outdir is not None else outdir
 
-    calibration_outputs = pcc.calibrate_consensus_from_results_dict(
-        results_dict=grid_outputs["results_dict"],
-        local_upper_values_km=local_upper_values_km,
-        target_families=target_families,
-        min_likely_pairs=min_likely_pairs,
-        min_consecutive=min_consecutive,
-        tol_km=tol_km,
-        round_to_km=round_to_km,
-        require_all_target_families=require_all_target_families,
-        min_plateau_families=min_plateau_families,
-    )
+    def _write_calibration_note(payload):
+        if not save_exports:
+            return
+        calibration_outdir.mkdir(exist_ok=True, parents=True)
+        with open(calibration_outdir / "PELT_consensus_calibration_note.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    calibration_attempts = [int(min_plateau_families)]
+    if fallback_min_plateau_families is not None:
+        fallback_min_plateau_families = int(fallback_min_plateau_families)
+        if fallback_min_plateau_families not in calibration_attempts:
+            calibration_attempts.append(fallback_min_plateau_families)
+
+    calibration_outputs = None
+    calibration_note = {
+        "status": "not_run",
+        "attempted_min_plateau_families": calibration_attempts,
+        "used_min_plateau_families": None,
+        "fallback_to_frozen_default": bool(fallback_to_frozen_default),
+        "reason": None,
+    }
+    last_error = None
+
+    for attempt_min_plateau_families in calibration_attempts:
+        try:
+            calibration_outputs = pcc.calibrate_consensus_from_results_dict(
+                results_dict=grid_outputs["results_dict"],
+                local_upper_values_km=local_upper_values_km,
+                target_families=target_families,
+                min_likely_pairs=min_likely_pairs,
+                min_consecutive=min_consecutive,
+                tol_km=tol_km,
+                round_to_km=round_to_km,
+                require_all_target_families=require_all_target_families,
+                min_plateau_families=attempt_min_plateau_families,
+            )
+            calibration_note["status"] = "calibrated"
+            calibration_note["used_min_plateau_families"] = int(attempt_min_plateau_families)
+            if attempt_min_plateau_families != int(min_plateau_families):
+                print(
+                    "Consensus calibration fallback succeeded with "
+                    f"min_plateau_families={attempt_min_plateau_families}."
+                )
+                calibration_note["reason"] = (
+                    f"primary min_plateau_families={int(min_plateau_families)} had no stable plateau"
+                )
+            break
+        except ValueError as exc:
+            if "No stable eligible-family plateau found" not in str(exc):
+                raise
+            last_error = exc
+
+    if calibration_outputs is None:
+        if not fallback_to_frozen_default:
+            raise last_error
+
+        frozen_consensus_cfg = grid_outputs.get("consensus_cfg", PELT.DEFAULT_FROZEN_CONSENSUS_CONFIG)
+        print(
+            "Consensus calibration fallback: no stable plateau found "
+            f"for min_plateau_families in {calibration_attempts}; "
+            "reusing the existing frozen/default consensus configuration."
+        )
+        calibration_note["status"] = "frozen_default_fallback"
+        calibration_note["reason"] = (
+            "No stable eligible-family plateau found; reused existing consensus_cfg."
+        )
+        _write_calibration_note(calibration_note)
+
+        updated_outputs = reapply_consensus_to_grid_outputs(
+            grid_outputs=grid_outputs,
+            consensus_cfg=frozen_consensus_cfg,
+            save_exports=save_exports,
+            outdir=outdir,
+            stable_support_frac_min=stable_support_frac_min,
+        )
+        updated_outputs["consensus_calibration"] = None
+        updated_outputs["consensus_calibration_outdir"] = calibration_outdir
+        updated_outputs["consensus_calibration_note"] = calibration_note
+        return updated_outputs
 
     if save_exports:
         pcc.save_calibration_artifacts(
             calibration_outputs=calibration_outputs,
             outdir=calibration_outdir,
         )
+        _write_calibration_note(calibration_note)
 
     updated_outputs = reapply_consensus_to_grid_outputs(
         grid_outputs=grid_outputs,
@@ -638,6 +710,7 @@ def calibrate_and_reapply_consensus_to_grid_outputs(
     )
     updated_outputs["consensus_calibration"] = calibration_outputs
     updated_outputs["consensus_calibration_outdir"] = calibration_outdir
+    updated_outputs["consensus_calibration_note"] = calibration_note
     return updated_outputs
 
 

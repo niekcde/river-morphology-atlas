@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Iterable
 
 import geopandas as gpd
+import numpy as np
+import pandas as pd
 
 import PELT_geometry_features as pgf
 import PELT_segmentation_runner as psr
@@ -49,12 +51,25 @@ def _load_mips_from_file(path: Path) -> list[int]:
 def _jsonify(value):
     if is_dataclass(value):
         return _jsonify(asdict(value))
+    if isinstance(value, pd.DataFrame):
+        return [_jsonify(row) for row in value.to_dict(orient="records")]
+    if isinstance(value, pd.Series):
+        return {str(k): _jsonify(v) for k, v in value.to_dict().items()}
+    if isinstance(value, np.ndarray):
+        return [_jsonify(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, dict):
         return {str(k): _jsonify(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonify(v) for v in value]
     if isinstance(value, Path):
         return str(value)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except TypeError:
+            pass
     return value
 
 
@@ -73,6 +88,11 @@ def _save_json(obj, path: Path) -> None:
 def _save_final_inputs(final_inputs: dict, tuning_outdir: Path) -> None:
     _save_pickle(final_inputs, tuning_outdir / "PELT_final_inputs.pkl")
     _save_json(final_inputs, tuning_outdir / "PELT_final_inputs.json")
+
+
+def _load_pickle(path: Path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def _load_inputs(sword_dir: Path, continent: str):
@@ -142,6 +162,36 @@ def _run_single_stage(
     return output
 
 
+def _load_single_stage_outputs(stage, out_root: Path):
+    stage_outdir = out_root / stage_output_dir_name(stage)
+    tuning_outdir = stage_outdir / "tuning"
+    final_outdir = stage_outdir / "final"
+
+    final_inputs_path = tuning_outdir / "PELT_final_inputs.pkl"
+    final_results_path = final_outdir / "PELT_final_results_dict.pkl"
+    final_summary_path = final_outdir / "PELT_final_summary.pkl"
+
+    missing = [
+        str(path)
+        for path in (final_inputs_path, final_results_path)
+        if not path.exists()
+    ]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Cannot skip stage {stage.name}: required saved outputs are missing: {missing_list}"
+        )
+
+    output = {
+        "stage": stage,
+        "final_inputs": _load_pickle(final_inputs_path),
+        "final_outputs": _load_pickle(final_results_path),
+    }
+    if final_summary_path.exists():
+        output["final_summary"] = _load_pickle(final_summary_path)
+    return output
+
+
 def stage_output_dir_name(stage) -> str:
     setup_map = {
         "width_channels": "01_width_channels",
@@ -176,6 +226,16 @@ def main() -> None:
     parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--min-segment-nodes", type=int, default=10)
     parser.add_argument(
+        "--skip-setup-01",
+        action="store_true",
+        help="Skip rerunning setup 01 and load its saved tuning/final outputs from disk.",
+    )
+    parser.add_argument(
+        "--skip-setup-02",
+        action="store_true",
+        help="Skip rerunning setup 02 and load its saved tuning/final outputs from disk.",
+    )
+    parser.add_argument(
         "--use-duckdb-centerline-merge",
         action="store_true",
         help="Use DuckDB spatial for centerline ST_Collect/ST_LineMerge. "
@@ -208,6 +268,8 @@ def main() -> None:
         "min_segment_nodes": args.min_segment_nodes,
         "parallel_tuning": args.parallel_tuning,
         "max_workers": args.max_workers,
+        "skip_setup_01": args.skip_setup_01,
+        "skip_setup_02": args.skip_setup_02,
         "centerline_merge_kwargs": {
             "endpoint_gap_tol": 160,
             "endpoint_gap_connected_tol": 1e-6,
@@ -232,29 +294,43 @@ def main() -> None:
 
     setup_by_name = {setup.name: setup for setup in psr.SEGMENTATION_SETUPS}
 
-    print("Running setup 01: width + nr_channels")
-    width_output = _run_single_stage(
-        stage=setup_by_name["01_width_channels"].stages[0],
-        dfG=dfG,
-        dfN=dfN,
-        mips=mips,
-        out_root=outdir,
-        centerlines=None,
-        geometry_feature_cfg=None,
-        args=args,
-    )
+    if args.skip_setup_01:
+        print("Skipping setup 01: loading saved width + nr_channels outputs from disk")
+        width_output = _load_single_stage_outputs(
+            stage=setup_by_name["01_width_channels"].stages[0],
+            out_root=outdir,
+        )
+    else:
+        print("Running setup 01: width + nr_channels")
+        width_output = _run_single_stage(
+            stage=setup_by_name["01_width_channels"].stages[0],
+            dfG=dfG,
+            dfN=dfN,
+            mips=mips,
+            out_root=outdir,
+            centerlines=None,
+            geometry_feature_cfg=None,
+            args=args,
+        )
 
-    print("Running setup 02: sinuosity + curvature")
-    sinu_output = _run_single_stage(
-        stage=setup_by_name["02_sinuosity_curvature"].stages[0],
-        dfG=dfG,
-        dfN=dfN,
-        mips=mips,
-        out_root=outdir,
-        centerlines=centerlines,
-        geometry_feature_cfg=geometry_feature_cfg,
-        args=args,
-    )
+    if args.skip_setup_02:
+        print("Skipping setup 02: loading saved sinuosity + curvature outputs from disk")
+        sinu_output = _load_single_stage_outputs(
+            stage=setup_by_name["02_sinuosity_curvature"].stages[0],
+            out_root=outdir,
+        )
+    else:
+        print("Running setup 02: sinuosity + curvature")
+        sinu_output = _run_single_stage(
+            stage=setup_by_name["02_sinuosity_curvature"].stages[0],
+            dfG=dfG,
+            dfN=dfN,
+            mips=mips,
+            out_root=outdir,
+            centerlines=centerlines,
+            geometry_feature_cfg=geometry_feature_cfg,
+            args=args,
+        )
 
     print("Running setup 03: width + nr_channels + sinuosity + curvature")
     all_output = _run_single_stage(
